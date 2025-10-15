@@ -366,10 +366,11 @@ async function handleRunStep(step) {
         switch (step.type) {
             case "Click": {
                 const timeout = Number(step.selectorWaitMs) || 5000;
-                const el = await waitForSelectorSafe(step.selector, timeout);
-                if (!el) return { ok: false, error: "selector_not_found" };
-                // Respond first, then perform the click to avoid losing the port on navigation
-                setTimeout(() => { try { el.click(); } catch {} }, 0);
+                const base = await waitForSelectorSafe(step.selector, timeout);
+                if (!base) return { ok: false, error: "selector_not_found" };
+                const el = findClickable(base);
+                // Respond first, then perform a robust synthetic click
+                setTimeout(() => { try { robustClick(el); } catch {} }, 0);
                 return { ok: true };
             }
 
@@ -475,4 +476,75 @@ async function waitForSelectorSafe(selector, timeoutMs) {
         await sleep(poll);
     }
     return null;
+}
+
+function findClickable(node) {
+    let el = node;
+    const isClickable = (e) => {
+        if (!e || e.nodeType !== Node.ELEMENT_NODE) return false;
+        const tag = e.tagName?.toLowerCase();
+        if (tag === 'button' || tag === 'a' || tag === 'summary') return true;
+        if (tag === 'input') {
+            const t = (e.getAttribute('type') || 'text').toLowerCase();
+            return ['button','submit','checkbox','radio','file','image','reset'].includes(t);
+        }
+        const role = e.getAttribute('role');
+        if (role && role.toLowerCase() === 'button') return true;
+        if (e.classList && (
+          e.classList.contains('btn') ||
+          e.classList.contains('button') ||
+          e.classList.contains('agora-btn')
+        )) return true;
+        // Has click handler
+        // eslint-disable-next-line no-underscore-dangle
+        if (typeof e.onclick === 'function') return true;
+        return false;
+    };
+    let cur = el;
+    for (let i = 0; i < 5 && cur; i++) {
+        if (isClickable(cur)) return cur;
+        cur = cur.parentElement;
+    }
+    return el;
+}
+
+function robustClick(el) {
+    if (!el || !(el instanceof Element)) return;
+    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch {}
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + Math.max(1, rect.width) / 2;
+    const y = rect.top + Math.max(1, rect.height) / 2;
+    // Try native click first via background (isTrusted). If it fails, fallback to synthetic.
+    try {
+        chrome.runtime.sendMessage({ type: 'NATIVE_CLICK', x, y }, (res) => {
+            if (chrome.runtime.lastError) {
+                // cannot use native; fallback
+                syntheticClick(el, x, y);
+                return;
+            }
+            if (!res || res.ok !== true) {
+                syntheticClick(el, x, y);
+            }
+        });
+    } catch {
+        syntheticClick(el, x, y);
+    }
+}
+
+function syntheticClick(el, x, y) {
+    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+    try {
+        el.dispatchEvent(new PointerEvent('pointerover', opts));
+        el.dispatchEvent(new PointerEvent('pointerenter', opts));
+        el.dispatchEvent(new MouseEvent('mouseover', opts));
+        el.dispatchEvent(new MouseEvent('mouseenter', opts));
+        el.dispatchEvent(new PointerEvent('pointerdown', opts));
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        if (typeof el.focus === 'function') try { el.focus({ preventScroll: true }); } catch {}
+        el.dispatchEvent(new PointerEvent('pointerup', opts));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+    } catch (e) {
+        try { el.click(); } catch {}
+    }
 }
