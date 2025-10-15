@@ -352,38 +352,46 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
     }
     if (msg.type === "RUN_STEP") {
-        handleRunStep(msg.step);
+        (async () => {
+            const res = await handleRunStep(msg.step || {});
+            try { sendResponse?.(res); } catch {}
+        })();
+        return true;
     }
 });
 
 async function handleRunStep(step) {
-    if (!step || typeof step.type !== "string") return;
+    if (!step || typeof step.type !== "string") return { ok: false, error: "invalid_step" };
     try {
         switch (step.type) {
-            case "Click":
-                document.querySelector(step.selector)?.click();
-                break;
+            case "Click": {
+                const timeout = Number(step.selectorWaitMs) || 5000;
+                const el = await waitForSelectorSafe(step.selector, timeout);
+                if (!el) return { ok: false, error: "selector_not_found" };
+                el.click();
+                return { ok: true };
+            }
 
             case "FillText": {
-                const el = document.querySelector(step.selector);
-                if (el) {
-                    el.focus();
-                    el.value = step.value;
-                    el.dispatchEvent(new Event("input", { bubbles: true }));
-                    el.dispatchEvent(new Event("change", { bubbles: true }));
-                }
-                break;
+                const timeout = Number(step.selectorWaitMs) || 5000;
+                const el = await waitForSelectorSafe(step.selector, timeout);
+                if (!el) return { ok: false, error: "selector_not_found" };
+                el.focus();
+                el.value = step.value;
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+                return { ok: true };
             }
 
             case "Wait":
                 await sleep(step.ms || 1000);
-                break;
+                return { ok: true };
 
             case "EnsureAudio": {
                 const resp = await sendRuntimeMessage({ type: "ENSURE_OFFSCREEN_AUDIO" });
                 if (resp && resp.ok) {
                     __audioUnlocked = true;
-                    break;
+                    return { ok: true };
                 }
                 ensureAudioPermissionPrompt();
                 try {
@@ -391,19 +399,19 @@ async function handleRunStep(step) {
                 } catch {
                     console.warn("[content] EnsureAudio timeout, continuing without sound.");
                 }
-                break;
+                return { ok: true };
             }
 
             case "PlaySound": {
                 const offscreenResp = await sendRuntimeMessage({ type: "PLAY_SOUND_OFFSCREEN" });
                 if (offscreenResp && offscreenResp.ok) {
                     __audioUnlocked = true;
-                    break;
+                    return { ok: true };
                 }
                 if (!__audioUnlocked) {
                     ensureAudioPermissionPrompt();
                     alert("Flow completed ✅");
-                    break;
+                    return { ok: true };
                 }
                 try {
                     try {
@@ -425,27 +433,45 @@ async function handleRunStep(step) {
                             source.start();
                             __audioUnlocked = true;
                             try { chrome.runtime.sendMessage({ type: "SHOW_NOTIFICATION", title: "AutoFiller", message: "Flow completed." }); } catch {}
-                            break;
+                            return { ok: true };
                         }
                     } catch {}
                     const audio = new Audio(chrome.runtime.getURL("assets/done.wav"));
                     await audio.play();
                     __audioUnlocked = true;
                     try { chrome.runtime.sendMessage({ type: "SHOW_NOTIFICATION", title: "AutoFiller", message: "Flow completed." }); } catch {}
+                    return { ok: true };
                 } catch (err) {
                     console.warn("[content] Audio play blocked, falling back to alert.", err);
                     ensureAudioPermissionPrompt();
                     alert("Flow completed ✅");
+                    return { ok: true };
                 }
-                break;
             }
 
             default:
-                break;
+                return { ok: true };
         }
     } catch (err) {
         console.error("[content] Step failed:", step, err);
+        return { ok: false, error: String(err?.message || err) };
     }
+    return { ok: true };
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function waitForSelectorSafe(selector, timeoutMs) {
+    if (!selector || typeof selector !== "string") return null;
+    const start = Date.now();
+    const poll = 100;
+    let el = null;
+    while (Date.now() - start <= timeoutMs) {
+        try {
+            el = document.querySelector(selector);
+            if (el) return el;
+        } catch {}
+        await sleep(poll);
+    }
+    return null;
+}
