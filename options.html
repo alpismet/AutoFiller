@@ -114,12 +114,36 @@
       flex-wrap: wrap;
       margin-bottom: 16px;
     }
+    .tabs {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 16px 0 8px;
+    }
+    .tabs .tab-btn {
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--card-bg);
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .tabs .tab-btn.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
     .top-bar { justify-content: space-between; }
     .top-bar .left {
       display: flex;
       align-items: center;
       gap: 12px;
       flex-wrap: wrap;
+    }
+    .top-bar .right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
     .flows {
       display: grid;
@@ -144,6 +168,27 @@
       font-weight: 600;
       font-size: 14px;
     }
+    .step-left {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--text-light);
+      background: transparent;
+    }
+    .status-running { color: #0ea5e9; border-color: #0ea5e9; }
+    .status-success { color: #16a34a; border-color: #16a34a; }
+    .status-error { color: #ef4444; border-color: #ef4444; }
+    .status-pending { color: #a78bfa; border-color: #a78bfa; }
+    .status-idle { color: var(--text-light); }
     .step-actions {
       display: flex;
       gap: 8px;
@@ -220,6 +265,26 @@
       background: transparent;
       color: inherit;
     }
+    .pin-btn {
+      width: 32px;
+      height: 28px;
+      display: grid;
+      place-items: center;
+      border-radius: 6px;
+    }
+    .pin-btn.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    /* Settings tab */
+    .settings {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .settings .setting-row { display: grid; gap: 6px; }
+    .settings .setting-row input { max-width: 220px; }
   </style>
 </head>
 <body>
@@ -228,6 +293,11 @@
       <h1>AutoFiller Flow Editor</h1>
       <p class="descr">Compose automation steps, save to storage, and run them on the active tab.</p>
     </header>
+
+    <nav class="tabs">
+      <button id="tabFlowBtn" class="tab-btn active">Flow</button>
+      <button id="tabSettingsBtn" class="tab-btn">Settings</button>
+    </nav>
 
     <div class="flow-name">
       <label for="flowName">Flow name</label>
@@ -244,14 +314,37 @@
           <span>Import JSON</span>
         </label>
       </div>
-      <button id="runFlow" class="primary">▶ Run Flow</button>
+      <div class="right">
+        <button id="pinToggle" class="icon pin-btn" title="Keep this window open">📌</button>
+        <button id="runFlow" class="primary">▶ Run Flow</button>
+      </div>
     </div>
 
-    <section id="stepsContainer" class="flows"></section>
-    <div id="emptyState" class="empty-state hidden">No steps yet. Click “Add Step” to begin.</div>
+    <section id="tab-flow" class="tab-panel">
+      <section id="stepsContainer" class="flows"></section>
+      <div id="emptyState" class="empty-state hidden">No steps yet. Click “Add Step” to begin.</div>
+    </section>
+
+    <section id="tab-settings" class="tab-panel hidden">
+      <div class="step-card">
+        <div class="step-header">
+          <span class="step-title">General Settings</span>
+        </div>
+        <div class="settings">
+          <div class="setting-row">
+            <label for="stepDelayMs">Inter-step delay (ms)</label>
+            <input id="stepDelayMs" type="number" min="0" step="50" placeholder="300" />
+          </div>
+          <div class="setting-row">
+            <label for="selectorWaitMs">Selector wait timeout (ms)</label>
+            <input id="selectorWaitMs" type="number" min="0" step="100" placeholder="5000" />
+          </div>
+        </div>
+      </div>
+    </section>
 
     <div class="bottom-bar">
-      <button id="saveFlow" class="primary">💾 Save Flow</button>
+      <button id="saveFlow" class="primary">💾 Save</button>
       <button id="discardChanges">Discard Changes</button>
       <div class="spacer"></div>
       <span id="status" class="status"></span>
@@ -261,7 +354,10 @@
   <template id="step-template">
     <article class="step-card">
       <div class="step-header">
-        <span class="step-title"></span>
+        <div class="step-left">
+          <span class="status-chip status-idle"><span class="chip-icon">○</span><span class="chip-label">Idle</span></span>
+          <span class="step-title"></span>
+        </div>
         <div class="step-actions">
           <button type="button" class="icon" data-action="up" title="Move up">↑</button>
           <button type="button" class="icon" data-action="down" title="Move down">↓</button>

@@ -199,21 +199,48 @@ async function ensureContentScript(tabId) {
 }
 
 async function runFlow(flow, tabId) {
-  for (const step of flow) {
-    console.log("→ Running step:", step.type);
+  // read settings
+  let settings = { stepDelayMs: 300, selectorWaitMs: 5000 };
+  try {
+    const s = await chrome.storage.local.get(["settings"]);
+    settings = { ...settings, ...(s?.settings || {}) };
+  } catch {}
 
-    if (step.type === "GoToURL") {
-      await chrome.tabs.update(tabId, { url: step.url });
-      await waitForTabLoad(tabId);
-      const url = await getTabUrl(tabId);
-      if (isForbiddenUrl(url)) throw new Error("Target page is not scriptable: " + url);
-      await ensureContentScript(tabId);
-    } else {
-      await ensureContentScript(tabId);
-      await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step });
-      await wait(200); // küçük tempo beklemesi
+  // notify options to reset statuses
+  broadcastToOptions({ type: "FLOW_STATUS", kind: "FLOW_RESET" });
+
+  for (let i = 0; i < flow.length; i++) {
+    const step = flow[i];
+    console.log("→ Running step:", step.type);
+    broadcastToOptions({ type: "FLOW_STATUS", index: i, status: "running" });
+    try {
+      if (step.type === "GoToURL") {
+        await chrome.tabs.update(tabId, { url: step.url });
+        await waitForTabLoad(tabId);
+        const url = await getTabUrl(tabId);
+        if (isForbiddenUrl(url)) throw new Error("Target page is not scriptable: " + url);
+        await ensureContentScript(tabId);
+      } else {
+        await ensureContentScript(tabId);
+        const res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs } });
+        // optional: evaluate res
+      }
+      broadcastToOptions({ type: "FLOW_STATUS", index: i, status: "success" });
+    } catch (err) {
+      console.warn("[background] Step failed:", err);
+      broadcastToOptions({ type: "FLOW_STATUS", index: i, status: "error", error: String(err) });
+      // stop on error or continue? For now, stop
+      throw err;
     }
+    const delay = Math.max(0, Number(settings.stepDelayMs) || 0);
+    if (delay) await wait(delay);
   }
+}
+
+function broadcastToOptions(payload) {
+  try {
+    chrome.runtime.sendMessage(payload, () => {});
+  } catch {}
 }
 
 function wait(ms) { return new Promise(r => setTimeout(r, ms)); }

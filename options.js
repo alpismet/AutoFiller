@@ -1,11 +1,23 @@
 // options.js — Flow Editor UI
 const DEFAULT_FLOW_NAME = "Example Flow";
 const DEFAULT_FLOW = [
-  { type: "GoToURL", url: "https://www.google.com/webhp?hl=tr-PT" },
-  { type: "Wait", ms: 800 },
-  { type: "FillText", selector: "textarea[name=\"q\"]", value: "hello"},
+  { type: "GoToURL", url: "https://www.google.com/" },
+  { type: "FillText", selector: "textarea[name=\"q\"]", value: "hello" },
   { type: "PlaySound" }
 ];
+
+const DEFAULT_SETTINGS = Object.freeze({
+  stepDelayMs: 300,
+  selectorWaitMs: 5000
+});
+
+const RUN_STATUS_META = {
+  idle: { icon: "○", label: "Idle", className: "status-idle" },
+  pending: { icon: "⏳", label: "Pending", className: "status-pending" },
+  running: { icon: "▶", label: "Running", className: "status-running" },
+  success: { icon: "✅", label: "Complete", className: "status-success" },
+  error: { icon: "⚠️", label: "Error", className: "status-error" }
+};
 
 const STEP_LIBRARY = [
   {
@@ -71,7 +83,17 @@ const els = {
   runFlow: document.getElementById("runFlow"),
   status: document.getElementById("status"),
   stepTemplate: document.getElementById("step-template"),
-  flowName: document.getElementById("flowName")
+  flowName: document.getElementById("flowName"),
+  // tabs
+  tabFlowBtn: document.getElementById("tabFlowBtn"),
+  tabSettingsBtn: document.getElementById("tabSettingsBtn"),
+  tabFlow: document.getElementById("tab-flow"),
+  tabSettings: document.getElementById("tab-settings"),
+  // settings controls
+  stepDelayMs: document.getElementById("stepDelayMs"),
+  selectorWaitMs: document.getElementById("selectorWaitMs"),
+  // pin toggle
+  pinToggle: document.getElementById("pinToggle")
 };
 
 const state = {
@@ -80,14 +102,23 @@ const state = {
   dirty: false,
   lastSaved: { steps: [], flowName: DEFAULT_FLOW_NAME },
   statusTimer: null,
-  pendingPicker: null
+  pendingPicker: null,
+  settings: { ...DEFAULT_SETTINGS },
+  stepStatuses: [] /* array of 'idle|pending|running|success|error' per step */,
+  pinned: false
 };
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
 
 chrome.runtime.onMessage.addListener((msg) => {
-  if (!msg || msg.type !== "PICKER_RESULT") return;
-  handlePickerResult(msg);
+  if (!msg || !msg.type) return;
+  if (msg.type === "PICKER_RESULT") {
+    handlePickerResult(msg);
+    return;
+  }
+  if (msg.type === "FLOW_STATUS") {
+    handleFlowStatus(msg);
+  }
 });
 
 init().catch((err) => {
@@ -109,6 +140,8 @@ async function init() {
     }
   });
   await loadFromStorage();
+  await initPinStateFromStorage();
+  initTabs();
   render();
 }
 
@@ -135,6 +168,7 @@ function wireEvents() {
     if (!confirm("Replace the current steps with the default example flow?")) return;
     state.steps = cloneFlow(DEFAULT_FLOW);
     state.flowName = DEFAULT_FLOW_NAME;
+    state.stepStatuses = state.steps.map(() => "idle");
     render();
     setDirty(true);
     showStatus("Loaded default flow. Save to persist.");
@@ -176,20 +210,62 @@ function wireEvents() {
     state.flowName = event.target.value;
     setDirty(true, { silent: true });
   });
+
+  // tabs
+  els.tabFlowBtn?.addEventListener("click", () => selectTab("flow"));
+  els.tabSettingsBtn?.addEventListener("click", () => selectTab("settings"));
+
+  // settings inputs
+  els.stepDelayMs?.addEventListener("input", (e) => {
+    const v = Number(e.target.value);
+    if (Number.isFinite(v) && v >= 0) {
+      state.settings.stepDelayMs = v;
+      setDirty(true, { silent: true });
+    }
+  });
+  els.selectorWaitMs?.addEventListener("input", (e) => {
+    const v = Number(e.target.value);
+    if (Number.isFinite(v) && v >= 0) {
+      state.settings.selectorWaitMs = v;
+      setDirty(true, { silent: true });
+    }
+  });
+
+  // pin toggle
+  els.pinToggle?.addEventListener("click", async () => {
+    state.pinned = !state.pinned;
+    reflectPinButton();
+    try {
+      await chrome.storage.local.set({ pinPopup: state.pinned });
+      if (state.pinned) {
+        await openPinnedWindow();
+        // close this popup if it's a popup
+        try {
+          const wnd = await chrome.windows.getCurrent();
+          if (wnd?.type === "popup") setTimeout(() => window.close(), 50);
+        } catch {}
+      }
+    } catch {}
+  });
 }
 
 async function loadFromStorage() {
   try {
-    const { activeFlow, flowName } = await chrome.storage.local.get(["activeFlow", "flowName"]);
+    const { activeFlow, flowName, settings } = await chrome.storage.local.get(["activeFlow", "flowName", "settings"]);
     const sanitized = sanitizeFlowArray(activeFlow);
     state.steps = sanitized.length ? sanitized : cloneFlow(DEFAULT_FLOW);
     state.flowName = typeof flowName === "string" && flowName.trim() ? flowName : DEFAULT_FLOW_NAME;
+    state.settings = { ...DEFAULT_SETTINGS, ...(settings || {}) };
+    // initialize statuses
+    state.stepStatuses = state.steps.map(() => "idle");
     snapshotAsSaved();
     setDirty(false, { silent: true });
   } catch (err) {
     console.warn("[options] Failed to load stored flow, using defaults:", err);
     state.steps = cloneFlow(DEFAULT_FLOW);
     state.flowName = DEFAULT_FLOW_NAME;
+    state.settings = { ...DEFAULT_SETTINGS };
+    state.stepStatuses = state.steps.map(() => "idle");
     snapshotAsSaved();
     setDirty(false, { silent: true });
   }
@@ -198,6 +274,9 @@ async function loadFromStorage() {
 function render() {
   renderSteps();
   els.flowName.value = state.flowName;
+  // settings reflect
+  if (els.stepDelayMs) els.stepDelayMs.value = String(state.settings.stepDelayMs ?? DEFAULT_SETTINGS.stepDelayMs);
+  if (els.selectorWaitMs) els.selectorWaitMs.value = String(state.settings.selectorWaitMs ?? DEFAULT_SETTINGS.selectorWaitMs);
   updateEmptyState();
   setControlsDisabled(Boolean(state.pendingPicker));
   if (state.pendingPicker) {
@@ -207,6 +286,7 @@ function render() {
       showStatus("Unsaved changes.");
     }
   }
+  reflectPinButton();
 }
 
 function renderSteps() {
@@ -228,8 +308,18 @@ function createStepCard(step, index) {
   const title = card.querySelector(".step-title");
   const typeSelect = card.querySelector(".step-type");
   const fieldsContainer = card.querySelector(".step-fields");
+  // status chip
+  const chip = card.querySelector(".status-chip");
+  const chipIcon = card.querySelector(".chip-icon");
+  const chipLabel = card.querySelector(".chip-label");
 
   title.textContent = `Step ${index + 1} — ${schema?.label || step.type}`;
+
+  // set status
+  const st = RUN_STATUS_META[state.stepStatuses[index] || "idle"] || RUN_STATUS_META.idle;
+  chipIcon.textContent = st.icon;
+  chipLabel.textContent = st.label;
+  chip.className = `status-chip ${st.className}`;
 
   STEP_LIBRARY.forEach((item) => {
     const option = document.createElement("option");
@@ -346,6 +436,7 @@ function addStep(type = STEP_LIBRARY[0].type) {
   const schema = STEP_LIBRARY_MAP.get(type) || STEP_LIBRARY[0];
   const newStep = createStepFromSchema(schema);
   state.steps.push(newStep);
+  state.stepStatuses.push("idle");
   updateEmptyState();
 }
 
@@ -355,6 +446,7 @@ function deleteStep(index) {
     return;
   }
   state.steps.splice(index, 1);
+  state.stepStatuses.splice(index, 1);
   render();
   setDirty(true);
   showStatus("Step removed.");
@@ -369,6 +461,8 @@ function moveStep(index, delta) {
   if (newIndex < 0 || newIndex >= state.steps.length) return;
   const [step] = state.steps.splice(index, 1);
   state.steps.splice(newIndex, 0, step);
+  const [st] = state.stepStatuses.splice(index, 1);
+  state.stepStatuses.splice(newIndex, 0, st || "idle");
   render();
   setDirty(true);
 }
@@ -468,10 +562,12 @@ async function persistFlow({ steps, flowName, silent } = {}) {
   try {
     await chrome.storage.local.set({
       activeFlow: prepared.steps,
-      flowName: prepared.flowName
+      flowName: prepared.flowName,
+      settings: state.settings
     });
     state.steps = sanitizeFlowArray(prepared.steps);
     state.flowName = prepared.flowName;
+    state.stepStatuses = state.steps.map(() => "idle");
     snapshotAsSaved();
     state.dirty = false;
     if (!silent) showStatus("Flow saved to storage.");
@@ -683,6 +779,7 @@ function applyImportedFlow(payload) {
   if (!sanitized.length) throw new Error("No valid steps in file.");
   state.steps = sanitized;
   state.flowName = importedName;
+  state.stepStatuses = state.steps.map(() => "idle");
 }
 
 function slugify(text) {
@@ -700,6 +797,9 @@ async function triggerRunFlow() {
     alert("Finish the element picker before running the flow.");
     return false;
   }
+  // reset statuses to pending
+  state.stepStatuses = state.steps.map(() => "pending");
+  render();
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) {
@@ -720,5 +820,73 @@ async function triggerRunFlow() {
     console.error("[options] Failed to start flow:", err);
     alert("Error starting flow: " + err.message);
     return false;
+  }
+}
+
+// tabs helpers
+function initTabs() {
+  // if hash indicates pinned window, mark state but leave UI same
+  const params = new URLSearchParams(location.hash.replace(/^#/, ""));
+  if (params.get("pinned") === "1") {
+    state.pinned = true;
+  }
+  selectTab("flow");
+}
+
+function selectTab(name) {
+  const flow = name === "flow";
+  els.tabFlowBtn?.classList.toggle("active", flow);
+  els.tabSettingsBtn?.classList.toggle("active", !flow);
+  els.tabFlow?.classList.toggle("hidden", !flow);
+  els.tabSettings?.classList.toggle("hidden", flow);
+}
+
+async function initPinStateFromStorage() {
+  try {
+    const { pinPopup } = await chrome.storage.local.get(["pinPopup"]);
+    state.pinned = Boolean(pinPopup);
+    reflectPinButton();
+    // If opened as popup and pin is enabled, auto-open a dedicated window
+    if (state.pinned && !new URLSearchParams(location.hash.slice(1)).has("pinned")) {
+      try {
+        const wnd = await chrome.windows.getCurrent();
+        if (wnd?.type === "popup") {
+          await openPinnedWindow();
+          setTimeout(() => { try { window.close(); } catch {} }, 50);
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+function reflectPinButton() {
+  if (!els.pinToggle) return;
+  els.pinToggle.classList.toggle("active", !!state.pinned);
+}
+
+async function openPinnedWindow() {
+  const url = chrome.runtime.getURL("options.html#pinned=1");
+  try {
+    await chrome.windows.create({ url, type: "popup", width: 820, height: 720 });
+  } catch (err) {
+    // fallback: open new tab
+    try { await chrome.tabs.create({ url }); } catch {}
+  }
+}
+
+// Flow status handling messages from background
+function handleFlowStatus(msg) {
+  if (msg.kind === "FLOW_RESET") {
+    state.stepStatuses = state.steps.map(() => "pending");
+    render();
+    return;
+  }
+  if (typeof msg.index === "number") {
+    const idx = msg.index;
+    if (!state.stepStatuses[idx]) return;
+    let status = msg.status; // running|success|error
+    if (!RUN_STATUS_META[status]) status = "idle";
+    state.stepStatuses[idx] = status;
+    render();
   }
 }
