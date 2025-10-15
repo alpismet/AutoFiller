@@ -78,6 +78,46 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // async sendResponse için kanalı açık tut
   }
 
+  if (msg.type === "RUN_SINGLE_STEP") {
+    (async () => {
+      try {
+        const targetTabId = msg.tabId || (await getActiveTabId());
+        if (!targetTabId) { sendResponse({ ok: false, error: "No active tab" }); return; }
+        const url = await getTabUrl(targetTabId);
+        if (isForbiddenUrl(url)) { sendResponse({ ok: false, error: "Forbidden URL" }); return; }
+        await ensureContentScript(targetTabId);
+
+        // settings
+        let settings = { selectorWaitMs: 5000 };
+        try { const s = await chrome.storage.local.get(["settings"]); settings = { ...settings, ...(s?.settings || {}) }; } catch {}
+
+        const index = typeof msg.index === "number" ? msg.index : -1;
+        if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "running" });
+        const step = sanitizeStep(msg.step) || msg.step;
+        if (!step) { sendResponse({ ok: false, error: "Invalid step" }); if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "error" }); return; }
+
+        if (step.type === "GoToURL") {
+          await chrome.tabs.update(targetTabId, { url: step.url });
+          await waitForTabLoad(targetTabId);
+          const cur = await getTabUrl(targetTabId);
+          if (isForbiddenUrl(cur)) throw new Error("Target page is not scriptable: " + cur);
+          await ensureContentScript(targetTabId);
+        } else {
+          await ensureContentScript(targetTabId);
+          const res = await chrome.tabs.sendMessage(targetTabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs } });
+          if (res && res.ok === false) throw new Error(res.error || "step_failed");
+        }
+        if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "success" });
+        sendResponse({ ok: true });
+      } catch (e) {
+        console.warn("[background] RUN_SINGLE_STEP error:", e);
+        try { if (typeof msg.index === "number") broadcastToOptions({ type: "FLOW_STATUS", index: msg.index, status: "error", error: String(e) }); } catch {}
+        sendResponse({ ok: false, error: String(e) });
+      }
+    })();
+    return true;
+  }
+
   if (msg.type === "SHOW_NOTIFICATION") {
     // Şimdilik bildirim API'sini çağırmıyoruz (ikon hataları yüzünden)
     try { sendResponse({ ok: true }); } catch {}
