@@ -340,7 +340,7 @@ function waitForCondition(fn, timeoutMs = 60000, pollMs = 100) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || !msg.type) return;
-    if (msg.type === "PING") return;
+    if (msg.type === "PING") { try { sendResponse?.({ ok: true, alive: true }); } catch {} return; }
     if (msg.type === "START_PICKER") {
         const ok = startSelectorPicker(msg.requestId || null);
         sendResponse?.({ ok });

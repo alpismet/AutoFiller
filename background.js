@@ -11,6 +11,7 @@ const DEFAULT_FLOW = [
 const OFFSCREEN_DOCUMENT_URL = "offscreen.html";
 let offscreenCreationPromise = null;
 let activePicker = null;
+let isFlowRunning = false;
 const STEP_SANITIZERS = {
   GoToURL(step) {
     const url = typeof step.url === "string" ? step.url.trim() : "";
@@ -49,6 +50,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         console.log("[background] Starting flow...");
+        if (isFlowRunning) {
+          sendResponse({ ok: false, error: "Flow is already running" });
+          return;
+        }
+        isFlowRunning = true;
         const flow = await fetchActiveFlow();
         if (!flow.length) {
           throw new Error("Flow is empty. Configure steps in the options page.");
@@ -64,6 +70,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } catch (e) {
         console.error("[background] RUN_FLOW error:", e);
         sendResponse({ ok: false, error: String(e) });
+      }
+      finally {
+        isFlowRunning = false;
       }
     })();
     return true; // async sendResponse için kanalı açık tut
@@ -190,6 +199,8 @@ async function ensureContentScript(tabId) {
     try {
       await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
       await wait(100);
+      // try ping again but swallow errors
+      try { await chrome.tabs.sendMessage(tabId, { type: "PING" }); } catch {}
       return true;
     } catch (e) {
       console.warn("[background] Failed to inject content.js:", e);
@@ -239,7 +250,8 @@ async function runFlow(flow, tabId) {
 
 function broadcastToOptions(payload) {
   try {
-    chrome.runtime.sendMessage(payload, () => {});
+    // Fire-and-forget without a callback to avoid Unchecked runtime.lastError
+    chrome.runtime.sendMessage(payload);
   } catch {}
 }
 
