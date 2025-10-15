@@ -328,6 +328,8 @@ function createStepCard(step, index) {
         moveStep(index, -1);
       } else if (action === "down") {
         moveStep(index, +1);
+      } else if (action === "run") {
+        runSingleStep(index);
       }
     });
   });
@@ -335,6 +337,52 @@ function createStepCard(step, index) {
   buildFields(fieldsContainer, schema, step, index);
 
   return card;
+}
+
+async function runSingleStep(index) {
+  if (state.pendingPicker) {
+    alert("Finish the element picker before running a step.");
+    return;
+  }
+  // Prepare just this step
+  const step = state.steps[index];
+  if (!step) return;
+  // Validate minimal required fields based on schema
+  const schema = STEP_LIBRARY_MAP.get(step.type);
+  if (!schema) { alert(`Unknown step type at #${index + 1}`); return; }
+  const prepared = { type: step.type };
+  for (const field of schema.fields) {
+    const value = step[field.key];
+    const isEmpty = value == null || (typeof value === "string" && value.trim() === "");
+    if (field.required && isEmpty) {
+      alert(`Step ${index + 1}: ${field.label} is required.`);
+      return;
+    }
+    if (!isEmpty) prepared[field.key] = field.type === "number" ? Number(value) : (typeof value === "string" ? value.trim() : value);
+  }
+  // Send to background to run single step
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) { alert("No active tab found."); return; }
+    // mark status pending for this step
+    state.stepStatuses[index] = "pending";
+    render();
+    const res = await chrome.runtime.sendMessage({ type: "RUN_SINGLE_STEP", tabId: tab.id, step: prepared, index });
+    if (!res?.ok) {
+      state.stepStatuses[index] = "error";
+      render();
+      alert("Step failed: " + (res?.error || "unknown error"));
+      return;
+    }
+    // Background will also broadcast success/error, but we update optimistically
+    state.stepStatuses[index] = "success";
+    render();
+  } catch (err) {
+    console.error("[options] Single step run failed:", err);
+    state.stepStatuses[index] = "error";
+    render();
+    alert("Error running step: " + err.message);
+  }
 }
 
 function buildFields(container, schema, step, stepIndex) {
