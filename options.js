@@ -91,9 +91,7 @@ const els = {
   tabSettings: document.getElementById("tab-settings"),
   // settings controls
   stepDelayMs: document.getElementById("stepDelayMs"),
-  selectorWaitMs: document.getElementById("selectorWaitMs"),
-  // pin toggle
-  pinToggle: document.getElementById("pinToggle")
+  selectorWaitMs: document.getElementById("selectorWaitMs")
 };
 
 const state = {
@@ -104,8 +102,7 @@ const state = {
   statusTimer: null,
   pendingPicker: null,
   settings: { ...DEFAULT_SETTINGS },
-  stepStatuses: [] /* array of 'idle|pending|running|success|error' per step */,
-  pinned: false
+  stepStatuses: [] /* array of 'idle|pending|running|success|error' per step */
 };
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
@@ -140,7 +137,6 @@ async function init() {
     }
   });
   await loadFromStorage();
-  await initPinStateFromStorage();
   initTabs();
   render();
 }
@@ -231,22 +227,6 @@ function wireEvents() {
     }
   });
 
-  // pin toggle
-  els.pinToggle?.addEventListener("click", async () => {
-    state.pinned = !state.pinned;
-    reflectPinButton();
-    try {
-      await chrome.storage.local.set({ pinPopup: state.pinned });
-      if (state.pinned) {
-        await openPinnedWindow();
-        // close this popup if it's a popup
-        try {
-          const wnd = await chrome.windows.getCurrent();
-          if (wnd?.type === "popup") setTimeout(() => window.close(), 50);
-        } catch {}
-      }
-    } catch {}
-  });
 }
 
 async function loadFromStorage() {
@@ -286,7 +266,6 @@ function render() {
       showStatus("Unsaved changes.");
     }
   }
-  reflectPinButton();
 }
 
 function renderSteps() {
@@ -308,8 +287,8 @@ function createStepCard(step, index) {
   const title = card.querySelector(".step-title");
   const typeSelect = card.querySelector(".step-type");
   const fieldsContainer = card.querySelector(".step-fields");
-  // status chip
-  const chip = card.querySelector(".status-chip");
+  // status chip (now in its own row)
+  const chip = card.querySelector(".step-status .status-chip");
   const chipIcon = card.querySelector(".chip-icon");
   const chipLabel = card.querySelector(".chip-label");
 
@@ -824,14 +803,7 @@ async function triggerRunFlow() {
 }
 
 // tabs helpers
-function initTabs() {
-  // if hash indicates pinned window, mark state but leave UI same
-  const params = new URLSearchParams(location.hash.replace(/^#/, ""));
-  if (params.get("pinned") === "1") {
-    state.pinned = true;
-  }
-  selectTab("flow");
-}
+function initTabs() { selectTab("flow"); }
 
 function selectTab(name) {
   const flow = name === "flow";
@@ -841,38 +813,7 @@ function selectTab(name) {
   els.tabSettings?.classList.toggle("hidden", flow);
 }
 
-async function initPinStateFromStorage() {
-  try {
-    const { pinPopup } = await chrome.storage.local.get(["pinPopup"]);
-    state.pinned = Boolean(pinPopup);
-    reflectPinButton();
-    // If opened as popup and pin is enabled, auto-open a dedicated window
-    if (state.pinned && !new URLSearchParams(location.hash.slice(1)).has("pinned")) {
-      try {
-        const wnd = await chrome.windows.getCurrent();
-        if (wnd?.type === "popup") {
-          await openPinnedWindow();
-          setTimeout(() => { try { window.close(); } catch {} }, 50);
-        }
-      } catch {}
-    }
-  } catch {}
-}
-
-function reflectPinButton() {
-  if (!els.pinToggle) return;
-  els.pinToggle.classList.toggle("active", !!state.pinned);
-}
-
-async function openPinnedWindow() {
-  const url = chrome.runtime.getURL("options.html#pinned=1");
-  try {
-    await chrome.windows.create({ url, type: "popup", width: 820, height: 720 });
-  } catch (err) {
-    // fallback: open new tab
-    try { await chrome.tabs.create({ url }); } catch {}
-  }
-}
+// pin logic removed
 
 // Flow status handling messages from background
 function handleFlowStatus(msg) {
