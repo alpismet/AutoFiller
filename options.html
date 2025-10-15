@@ -140,11 +140,7 @@
       gap: 12px;
       flex-wrap: wrap;
     }
-    .top-bar .right {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
+    .top-bar .right { display: flex; align-items: center; gap: 8px; }
     .flows {
       display: grid;
       gap: 12px;
@@ -168,11 +164,7 @@
       font-weight: 600;
       font-size: 14px;
     }
-    .step-left {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-    }
+    .step-status { margin-bottom: 8px; }
     .status-chip {
       display: inline-flex;
       align-items: center;
@@ -265,18 +257,7 @@
       background: transparent;
       color: inherit;
     }
-    .pin-btn {
-      width: 32px;
-      height: 28px;
-      display: grid;
-      place-items: center;
-      border-radius: 6px;
-    }
-    .pin-btn.active {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-    }
+    /* pin button removed */
     /* Settings tab */
     .settings {
       display: grid;
@@ -315,7 +296,6 @@
         </label>
       </div>
       <div class="right">
-        <button id="pinToggle" class="icon pin-btn" title="Keep this window open">📌</button>
         <button id="runFlow" class="primary">▶ Run Flow</button>
       </div>
     </div>
@@ -353,11 +333,11 @@
 
   <template id="step-template">
     <article class="step-card">
+      <div class="step-status">
+        <span class="status-chip status-idle"><span class="chip-icon">○</span><span class="chip-label">Idle</span></span>
+      </div>
       <div class="step-header">
-        <div class="step-left">
-          <span class="status-chip status-idle"><span class="chip-icon">○</span><span class="chip-label">Idle</span></span>
-          <span class="step-title"></span>
-        </div>
+        <span class="step-title"></span>
         <div class="step-actions">
           <button type="button" class="icon" data-action="up" title="Move up">↑</button>
           <button type="button" class="icon" data-action="down" title="Move down">↓</button>
