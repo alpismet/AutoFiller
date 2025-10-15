@@ -1,0 +1,27 @@
+{
+  "name": "AutoFiller Flow Runner",
+  "version": "1.0.14",
+  "manifest_version": 3,
+  "description": "Runs predefined automation flow steps on websites.",
+  "permissions": ["storage", "scripting", "activeTab", "tabs", "notifications", "offscreen"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "AutoFiller",
+    "default_popup": "options.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

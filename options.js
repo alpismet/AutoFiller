@@ -1,0 +1,724 @@
+// options.js — Flow Editor UI
+const DEFAULT_FLOW_NAME = "Example Flow";
+const DEFAULT_FLOW = [
+  { type: "GoToURL", url: "https://www.google.com/webhp?hl=tr-PT" },
+  { type: "Wait", ms: 800 },
+  { type: "FillText", selector: "textarea[name=\"q\"]", value: "hello"},
+  { type: "PlaySound" }
+];
+
+const STEP_LIBRARY = [
+  {
+    type: "GoToURL",
+    label: "Go to URL",
+    description: "Navigate the target tab to a specific URL.",
+    fields: [
+      { key: "url", label: "URL", type: "url", required: true, placeholder: "https://www.google.com" }
+    ]
+  },
+  {
+    type: "Click",
+    label: "Click element",
+    description: "Click the first element matching the selector.",
+    fields: [
+      { key: "selector", label: "CSS Selector", type: "text", required: true, placeholder: "#submit", supportsPicker: true }
+    ]
+  },
+  {
+    type: "FillText",
+    label: "Fill text",
+    description: "Type into an input matching the selector.",
+    fields: [
+      { key: "selector", label: "CSS Selector", type: "text", required: true, placeholder: "input[name='email']", supportsPicker: true },
+      { key: "value", label: "Value", type: "textarea", required: true, placeholder: "hello@example.com" }
+    ]
+  },
+  {
+    type: "Wait",
+    label: "Wait",
+    description: "Pause the flow for a number of milliseconds.",
+    fields: [
+      { key: "ms", label: "Milliseconds", type: "number", required: true, placeholder: "1000", min: 0, step: 100, default: 1000 }
+    ]
+  },
+  {
+    type: "EnsureAudio",
+    label: "Ensure audio",
+    description: "Prompt the tab to allow audio playback if necessary.",
+    fields: [
+      { key: "timeoutMs", label: "Timeout (ms)", type: "number", placeholder: "60000", min: 1000, step: 500, default: 60000 }
+    ]
+  },
+  {
+    type: "PlaySound",
+    label: "Play sound",
+    description: "Play the completion chime (requires audio permission).",
+    fields: []
+  }
+];
+
+const STEP_LIBRARY_MAP = new Map(STEP_LIBRARY.map((step) => [step.type, step]));
+
+const els = {
+  stepsContainer: document.getElementById("stepsContainer"),
+  emptyState: document.getElementById("emptyState"),
+  addStep: document.getElementById("addStep"),
+  saveFlow: document.getElementById("saveFlow"),
+  discardChanges: document.getElementById("discardChanges"),
+  loadDefault: document.getElementById("loadDefault"),
+  exportFlow: document.getElementById("exportFlow"),
+  importFlow: document.getElementById("importFlow"),
+  runFlow: document.getElementById("runFlow"),
+  status: document.getElementById("status"),
+  stepTemplate: document.getElementById("step-template"),
+  flowName: document.getElementById("flowName")
+};
+
+const state = {
+  steps: [],
+  flowName: DEFAULT_FLOW_NAME,
+  dirty: false,
+  lastSaved: { steps: [], flowName: DEFAULT_FLOW_NAME },
+  statusTimer: null,
+  pendingPicker: null
+};
+
+const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== "PICKER_RESULT") return;
+  handlePickerResult(msg);
+});
+
+init().catch((err) => {
+  console.error("[options] Failed to initialise:", err);
+  alert("Flow editor failed to load. Check the console for details.");
+});
+
+async function init() {
+  wireEvents();
+  window.addEventListener("beforeunload", () => {
+    if (state.pendingPicker) {
+      try {
+        chrome.runtime.sendMessage({
+          type: "CANCEL_SELECTOR_PICKER",
+          requestId: state.pendingPicker.requestId,
+          tabId: state.pendingPicker.tabId
+        });
+      } catch {}
+    }
+  });
+  await loadFromStorage();
+  render();
+}
+
+function wireEvents() {
+  els.addStep?.addEventListener("click", () => {
+    addStep();
+    render();
+    setDirty(true);
+  });
+
+  els.saveFlow?.addEventListener("click", async () => {
+    const saved = await persistFlow();
+    if (saved) showStatus("Flow saved to storage.");
+  });
+
+  els.discardChanges?.addEventListener("click", () => {
+    restoreLastSaved();
+    render();
+    setDirty(false);
+    showStatus("Changes discarded.");
+  });
+
+  els.loadDefault?.addEventListener("click", () => {
+    if (!confirm("Replace the current steps with the default example flow?")) return;
+    state.steps = cloneFlow(DEFAULT_FLOW);
+    state.flowName = DEFAULT_FLOW_NAME;
+    render();
+    setDirty(true);
+    showStatus("Loaded default flow. Save to persist.");
+  });
+
+  els.exportFlow?.addEventListener("click", () => {
+    exportFlow();
+  });
+
+  els.importFlow?.addEventListener("change", async (event) => {
+    const file = event.target?.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      applyImportedFlow(payload);
+      render();
+      setDirty(true);
+      showStatus("Imported flow. Save to persist.");
+    } catch (err) {
+      console.error("[options] Import failed:", err);
+      alert("Invalid flow JSON. Details in the console.");
+    } finally {
+      event.target.value = "";
+    }
+  });
+
+  els.runFlow?.addEventListener("click", async () => {
+    const prepared = validateAndPrepare();
+    if (!prepared) return;
+    await persistFlow({ steps: prepared.steps, flowName: prepared.flowName, silent: true });
+    const ok = await triggerRunFlow();
+    if (ok) {
+      showStatus("Flow dispatched to active tab.");
+    }
+  });
+
+  els.flowName?.addEventListener("input", (event) => {
+    state.flowName = event.target.value;
+    setDirty(true, { silent: true });
+  });
+}
+
+async function loadFromStorage() {
+  try {
+    const { activeFlow, flowName } = await chrome.storage.local.get(["activeFlow", "flowName"]);
+    const sanitized = sanitizeFlowArray(activeFlow);
+    state.steps = sanitized.length ? sanitized : cloneFlow(DEFAULT_FLOW);
+    state.flowName = typeof flowName === "string" && flowName.trim() ? flowName : DEFAULT_FLOW_NAME;
+    snapshotAsSaved();
+    setDirty(false, { silent: true });
+  } catch (err) {
+    console.warn("[options] Failed to load stored flow, using defaults:", err);
+    state.steps = cloneFlow(DEFAULT_FLOW);
+    state.flowName = DEFAULT_FLOW_NAME;
+    snapshotAsSaved();
+    setDirty(false, { silent: true });
+  }
+}
+
+function render() {
+  renderSteps();
+  els.flowName.value = state.flowName;
+  updateEmptyState();
+  setControlsDisabled(Boolean(state.pendingPicker));
+  if (state.pendingPicker) {
+    showStatus(PICKER_STATUS_TEXT, { persistent: true });
+  } else if (state.dirty) {
+    if (!els.status.textContent) {
+      showStatus("Unsaved changes.");
+    }
+  }
+}
+
+function renderSteps() {
+  const container = els.stepsContainer;
+  if (!container) return;
+  container.innerHTML = "";
+
+  state.steps.forEach((step, index) => {
+    const card = createStepCard(step, index);
+    container.appendChild(card);
+  });
+}
+
+function createStepCard(step, index) {
+  const template = els.stepTemplate;
+  const schema = STEP_LIBRARY_MAP.get(step.type) || STEP_LIBRARY[0];
+  const fragment = template.content.cloneNode(true);
+  const card = fragment.querySelector(".step-card");
+  const title = card.querySelector(".step-title");
+  const typeSelect = card.querySelector(".step-type");
+  const fieldsContainer = card.querySelector(".step-fields");
+
+  title.textContent = `Step ${index + 1} — ${schema?.label || step.type}`;
+
+  STEP_LIBRARY.forEach((item) => {
+    const option = document.createElement("option");
+    option.value = item.type;
+    option.textContent = item.label;
+    option.selected = item.type === step.type;
+    typeSelect.appendChild(option);
+  });
+
+  typeSelect.addEventListener("change", (event) => {
+    const newType = event.target.value;
+    updateStepType(index, newType);
+    render();
+    setDirty(true);
+  });
+
+  typeSelect.disabled = Boolean(state.pendingPicker);
+
+  const actions = card.querySelectorAll(".step-actions [data-action]");
+  actions.forEach((btn) => {
+    btn.disabled = Boolean(state.pendingPicker);
+    btn.addEventListener("click", () => {
+      const action = btn.dataset.action;
+      if (action === "delete") {
+        deleteStep(index);
+      } else if (action === "up") {
+        moveStep(index, -1);
+      } else if (action === "down") {
+        moveStep(index, +1);
+      }
+    });
+  });
+
+  buildFields(fieldsContainer, schema, step, index);
+
+  return card;
+}
+
+function buildFields(container, schema, step, stepIndex) {
+  container.innerHTML = "";
+  if (!schema) return;
+
+  schema.fields.forEach((field) => {
+    const fieldWrapper = document.createElement("div");
+    fieldWrapper.className = "field";
+
+    const label = document.createElement("label");
+    label.textContent = field.label;
+
+    let input;
+    if (field.type === "textarea") {
+      input = document.createElement("textarea");
+    } else {
+      input = document.createElement("input");
+      input.type = field.type === "number" ? "number" : field.type === "url" ? "url" : "text";
+    }
+
+    input.placeholder = field.placeholder || "";
+    if (field.type === "number") {
+      if (typeof field.min !== "undefined") input.min = String(field.min);
+      if (typeof field.max !== "undefined") input.max = String(field.max);
+      if (typeof field.step !== "undefined") input.step = String(field.step);
+    }
+
+    const existing = step[field.key];
+    if (existing !== undefined && existing !== null) {
+      input.value = String(existing);
+    } else if (field.default !== undefined) {
+      input.value = String(field.default);
+    }
+
+    input.addEventListener("input", (event) => {
+      const rawValue = event.target.value;
+      setDirty(true, { silent: true });
+      updateFieldValue(stepIndex, field, rawValue);
+    });
+
+    let inputHost = input;
+    if (field.supportsPicker) {
+      const row = document.createElement("div");
+      row.className = "input-row";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "icon picker-btn";
+      btn.title = "Pick element from active tab";
+      btn.textContent = "🎯";
+      const isActive = isPickerContext(stepIndex, field.key);
+      btn.classList.toggle("active", isActive);
+      btn.disabled = Boolean(state.pendingPicker) && !isActive;
+      btn.addEventListener("click", () => {
+        requestSelectorPick({ stepIndex, field });
+      });
+      row.appendChild(input);
+      row.appendChild(btn);
+      inputHost = row;
+      if (isActive) {
+        fieldWrapper.classList.add("picking");
+      } else {
+        fieldWrapper.classList.remove("picking");
+      }
+    }
+
+    fieldWrapper.appendChild(label);
+    fieldWrapper.appendChild(inputHost);
+    container.appendChild(fieldWrapper);
+  });
+}
+
+function addStep(type = STEP_LIBRARY[0].type) {
+  if (state.pendingPicker) {
+    alert("Finish the element picker first.");
+    return;
+  }
+  const schema = STEP_LIBRARY_MAP.get(type) || STEP_LIBRARY[0];
+  const newStep = createStepFromSchema(schema);
+  state.steps.push(newStep);
+  updateEmptyState();
+}
+
+function deleteStep(index) {
+  if (state.pendingPicker) {
+    alert("Finish the element picker first.");
+    return;
+  }
+  state.steps.splice(index, 1);
+  render();
+  setDirty(true);
+  showStatus("Step removed.");
+}
+
+function moveStep(index, delta) {
+  if (state.pendingPicker) {
+    alert("Finish the element picker first.");
+    return;
+  }
+  const newIndex = index + delta;
+  if (newIndex < 0 || newIndex >= state.steps.length) return;
+  const [step] = state.steps.splice(index, 1);
+  state.steps.splice(newIndex, 0, step);
+  render();
+  setDirty(true);
+}
+
+function updateStepType(index, newType) {
+  if (state.pendingPicker) return;
+  const schema = STEP_LIBRARY_MAP.get(newType);
+  if (!schema) return;
+  const current = state.steps[index] || {};
+  const next = createStepFromSchema(schema);
+  schema.fields.forEach((field) => {
+    if (current[field.key] !== undefined && current[field.key] !== null) {
+      next[field.key] = current[field.key];
+    }
+  });
+  next.type = newType;
+  state.steps[index] = next;
+}
+
+function updateFieldValue(stepIndex, field, rawValue) {
+  const step = state.steps[stepIndex];
+  if (!step) return;
+  step[field.key] = rawValue;
+}
+
+function createStepFromSchema(schema) {
+  const base = { type: schema.type };
+  schema.fields.forEach((field) => {
+    if (field.default !== undefined) {
+      base[field.key] = field.type === "number" ? field.default : field.default;
+    } else {
+      base[field.key] = field.type === "number" ? "" : "";
+    }
+  });
+  return base;
+}
+
+function updateEmptyState() {
+  if (!els.emptyState) return;
+  if (state.steps.length === 0) {
+    els.emptyState.classList.remove("hidden");
+  } else {
+    els.emptyState.classList.add("hidden");
+  }
+}
+
+function setControlsDisabled(disabled) {
+  const toggle = (el) => {
+    if (!el) return;
+    el.disabled = disabled;
+  };
+  toggle(els.addStep);
+  toggle(els.saveFlow);
+  toggle(els.discardChanges);
+  toggle(els.loadDefault);
+  toggle(els.exportFlow);
+  toggle(els.runFlow);
+  if (els.importFlow) {
+    els.importFlow.disabled = disabled;
+    const label = els.importFlow.closest(".import-btn");
+    if (label) label.classList.toggle("disabled", disabled);
+  }
+}
+
+function isPickerContext(stepIndex, fieldKey) {
+  const pending = state.pendingPicker;
+  if (!pending) return false;
+  return pending.stepIndex === stepIndex && pending.fieldKey === fieldKey;
+}
+
+function setDirty(flag, { silent } = {}) {
+  state.dirty = flag;
+  if (flag && !silent) {
+    showStatus("Unsaved changes.");
+  }
+}
+
+function showStatus(message, { persistent = false } = {}) {
+  if (!els.status) return;
+  if (state.statusTimer) {
+    clearTimeout(state.statusTimer);
+    state.statusTimer = null;
+  }
+  els.status.textContent = message || "";
+  if (message && !persistent) {
+    state.statusTimer = setTimeout(() => {
+      if (!state.pendingPicker) {
+        els.status.textContent = "";
+      }
+    }, 3200);
+  }
+}
+
+async function persistFlow({ steps, flowName, silent } = {}) {
+  const prepared = steps && flowName ? { steps, flowName } : validateAndPrepare();
+  if (!prepared) return false;
+  try {
+    await chrome.storage.local.set({
+      activeFlow: prepared.steps,
+      flowName: prepared.flowName
+    });
+    state.steps = sanitizeFlowArray(prepared.steps);
+    state.flowName = prepared.flowName;
+    snapshotAsSaved();
+    state.dirty = false;
+    if (!silent) showStatus("Flow saved to storage.");
+    render();
+    return true;
+  } catch (err) {
+    console.error("[options] Failed to save flow:", err);
+    alert("Failed to save flow. See console for details.");
+    return false;
+  }
+}
+
+function restoreLastSaved() {
+  state.steps = cloneFlow(state.lastSaved.steps);
+  state.flowName = state.lastSaved.flowName;
+}
+
+function snapshotAsSaved() {
+  state.lastSaved = {
+    steps: cloneFlow(state.steps),
+    flowName: state.flowName
+  };
+}
+
+function validateAndPrepare() {
+  const errors = [];
+  const preparedSteps = [];
+
+  state.steps.forEach((step, index) => {
+    const schema = STEP_LIBRARY_MAP.get(step.type);
+    if (!schema) {
+      errors.push(`Step ${index + 1}: Unknown type "${step.type}".`);
+      return;
+    }
+    const prepared = { type: step.type };
+    schema.fields.forEach((field) => {
+      const value = step[field.key];
+      const isEmpty = value === null || value === undefined || (typeof value === "string" && value.trim() === "");
+      if (field.required && isEmpty) {
+        errors.push(`Step ${index + 1}: ${field.label} is required.`);
+        return;
+      }
+      if (field.type === "number") {
+        if (isEmpty) return;
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) {
+          errors.push(`Step ${index + 1}: ${field.label} must be a number.`);
+          return;
+        }
+        if (typeof field.min === "number" && numeric < field.min) {
+          errors.push(`Step ${index + 1}: ${field.label} must be ≥ ${field.min}.`);
+          return;
+        }
+        prepared[field.key] = numeric;
+      } else if (!isEmpty) {
+        prepared[field.key] = typeof value === "string" ? value.trim() : value;
+      }
+    });
+    preparedSteps.push(prepared);
+  });
+
+  if (errors.length) {
+    alert("Fix the following issues before saving:\n\n" + errors.join("\n"));
+    return null;
+  }
+
+  const flowName = state.flowName && state.flowName.trim() ? state.flowName.trim() : DEFAULT_FLOW_NAME;
+
+  if (!preparedSteps.length) {
+    alert("Add at least one step before saving or running the flow.");
+    return null;
+  }
+
+  return { steps: preparedSteps, flowName };
+}
+
+async function requestSelectorPick({ stepIndex, field }) {
+  if (state.pendingPicker) {
+    const proceed = confirm("Cancel the current element picker?");
+    if (!proceed) return;
+    await cancelPicker({ silent: true });
+  }
+
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) {
+      alert("No active tab found. Open a regular webpage and try again.");
+      return;
+    }
+
+    const requestId = `pick_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    state.pendingPicker = {
+      requestId,
+      stepIndex,
+      fieldKey: field.key,
+      tabId: tab.id
+    };
+    render();
+    showStatus(PICKER_STATUS_TEXT, { persistent: true });
+
+    const res = await chrome.runtime.sendMessage({
+      type: "START_SELECTOR_PICKER",
+      requestId,
+      tabId: tab.id
+    });
+    if (!res || !res.ok) {
+      throw new Error(res?.error || "Unable to start picker on the active tab.");
+    }
+  } catch (err) {
+    console.error("[options] Failed to start element picker:", err);
+    alert(err?.message || "Unable to start element picker.");
+    state.pendingPicker = null;
+    render();
+    showStatus(err?.message || "Unable to start element picker.");
+  }
+}
+
+async function cancelPicker({ silent } = {}) {
+  if (!state.pendingPicker) return;
+  const { requestId, tabId } = state.pendingPicker;
+  state.pendingPicker = null;
+  render();
+  try {
+    await chrome.runtime.sendMessage({
+      type: "CANCEL_SELECTOR_PICKER",
+      requestId,
+      tabId
+    });
+  } catch (err) {
+    console.warn("[options] Failed to cancel picker:", err);
+  }
+  if (!silent) {
+    showStatus("Element picker cancelled.");
+  }
+}
+
+function handlePickerResult(msg) {
+  const pending = state.pendingPicker;
+  if (!pending || msg.requestId !== pending.requestId) return;
+  state.pendingPicker = null;
+  if (msg.success && msg.selector) {
+    const { stepIndex, fieldKey } = pending;
+    if (state.steps[stepIndex]) {
+      state.steps[stepIndex][fieldKey] = msg.selector;
+      setDirty(true, { silent: true });
+      render();
+      showStatus(`Selector captured: ${msg.selector}`);
+      return;
+    }
+    render();
+    showStatus("Selector captured, but the step no longer exists.");
+  } else {
+    render();
+    if (msg.reason === "selector_not_found") {
+      showStatus("Could not determine a unique selector. Try a different element.");
+    } else {
+      showStatus("Element picker cancelled.");
+    }
+  }
+}
+
+function sanitizeFlowArray(value) {
+  if (!Array.isArray(value)) return [];
+  const sanitized = [];
+  value.forEach((step) => {
+    const schema = STEP_LIBRARY_MAP.get(step?.type);
+    if (!schema) return;
+    const normalized = { type: schema.type };
+    schema.fields.forEach((field) => {
+      if (step[field.key] !== undefined && step[field.key] !== null) {
+        normalized[field.key] = step[field.key];
+      } else if (field.default !== undefined) {
+        normalized[field.key] = field.default;
+      }
+    });
+    sanitized.push(normalized);
+  });
+  return sanitized;
+}
+
+function cloneFlow(flow) {
+  return Array.isArray(flow) ? flow.map((step) => ({ ...step })) : [];
+}
+
+function exportFlow() {
+  const prepared = validateAndPrepare();
+  if (!prepared) return;
+  const payload = {
+    name: prepared.flowName,
+    steps: prepared.steps
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${slugify(prepared.flowName)}.json`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+  showStatus("Flow exported as JSON.");
+}
+
+function applyImportedFlow(payload) {
+  const importedSteps = Array.isArray(payload) ? payload : Array.isArray(payload?.steps) ? payload.steps : null;
+  if (!importedSteps) throw new Error("Missing steps array.");
+  const importedName = typeof payload?.name === "string" ? payload.name : DEFAULT_FLOW_NAME;
+  const sanitized = sanitizeFlowArray(importedSteps);
+  if (!sanitized.length) throw new Error("No valid steps in file.");
+  state.steps = sanitized;
+  state.flowName = importedName;
+}
+
+function slugify(text) {
+  const fallback = "flow";
+  if (!text) return fallback;
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .substring(0, 50) || fallback;
+}
+
+async function triggerRunFlow() {
+  if (state.pendingPicker) {
+    alert("Finish the element picker before running the flow.");
+    return false;
+  }
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) {
+      alert("No active tab found. Open a regular webpage and try again.");
+      return false;
+    }
+    const res = await chrome.runtime.sendMessage({ type: "RUN_FLOW", tabId: tab.id });
+    if (!res) {
+      alert("Background service worker did not respond. Try reloading the extension.");
+      return false;
+    }
+    if (!res.ok) {
+      alert("Failed to start flow: " + (res.error || "unknown error"));
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("[options] Failed to start flow:", err);
+    alert("Error starting flow: " + err.message);
+    return false;
+  }
+}

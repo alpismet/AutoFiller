@@ -1,0 +1,281 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AutoFiller Flow Editor</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      --bg: #f5f7fb;
+      --card-bg: #ffffff;
+      --border: #d6dce5;
+      --border-strong: #94a3b8;
+      --text: #0f172a;
+      --text-light: #475569;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --danger: #dc2626;
+      --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111827;
+        --card-bg: #1f2937;
+        --border: #374151;
+        --border-strong: #4b5563;
+        --text: #e2e8f0;
+        --text-light: #94a3b8;
+        --accent: #3b82f6;
+        --accent-hover: #2563eb;
+        --danger: #f87171;
+        --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+      }
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+      min-width: 340px;
+      background: var(--bg);
+      color: var(--text);
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+    }
+    p.descr {
+      margin: 6px 0 18px;
+      color: var(--text-light);
+      font-size: 14px;
+    }
+    button, label.import-btn span {
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--card-bg);
+      color: inherit;
+      padding: 8px 14px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+    button.primary {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+    button.icon {
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      display: grid;
+      place-items: center;
+      font-size: 15px;
+      border-radius: 6px;
+    }
+    button.icon.picker-btn {
+      width: 32px;
+      font-size: 16px;
+    }
+    button.icon.picker-btn.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button.danger {
+      border-color: var(--danger);
+      color: var(--danger);
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+    .import-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .import-btn span {
+      display: inline-block;
+      border-style: dashed;
+    }
+    .import-btn.disabled span {
+      opacity: 0.45;
+      pointer-events: none;
+    }
+    .container {
+      max-width: 720px;
+      margin: 0 auto;
+    }
+    .top-bar, .bottom-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .top-bar { justify-content: space-between; }
+    .top-bar .left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .flows {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .step-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: var(--shadow);
+    }
+    .step-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .step-title {
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .step-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .field {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .field .input-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .field:last-child { margin-bottom: 0; }
+    .field label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-light);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .field input,
+    .field textarea,
+    .field select {
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      padding: 8px 10px;
+      font-size: 13px;
+      background: transparent;
+      color: inherit;
+    }
+    .field.picking input,
+    .field.picking select,
+    .field.picking textarea {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.25);
+    }
+    .field.picking label {
+      color: var(--accent);
+    }
+    .field textarea {
+      resize: vertical;
+      min-height: 60px;
+    }
+    .empty-state {
+      padding: 24px;
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      text-align: center;
+      color: var(--text-light);
+      font-size: 14px;
+    }
+    .hidden { display: none !important; }
+    .status {
+      font-size: 12px;
+      color: var(--text-light);
+      margin-left: auto;
+    }
+    .bottom-bar { margin-top: 24px; }
+    .bottom-bar button { min-width: 120px; }
+    .bottom-bar .spacer { flex: 1; }
+    .flow-name {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 16px;
+    }
+    .flow-name input {
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      padding: 8px 10px;
+      font-size: 14px;
+      background: transparent;
+      color: inherit;
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>AutoFiller Flow Editor</h1>
+      <p class="descr">Compose automation steps, save to storage, and run them on the active tab.</p>
+    </header>
+
+    <div class="flow-name">
+      <label for="flowName">Flow name</label>
+      <input id="flowName" type="text" placeholder="My flow" />
+    </div>
+
+    <div class="top-bar">
+      <div class="left">
+        <button id="addStep" class="primary">＋ Add Step</button>
+        <button id="loadDefault">Reset to Default</button>
+        <button id="exportFlow">Export JSON</button>
+        <label class="import-btn">
+          <input id="importFlow" type="file" accept="application/json" hidden />
+          <span>Import JSON</span>
+        </label>
+      </div>
+      <button id="runFlow" class="primary">▶ Run Flow</button>
+    </div>
+
+    <section id="stepsContainer" class="flows"></section>
+    <div id="emptyState" class="empty-state hidden">No steps yet. Click “Add Step” to begin.</div>
+
+    <div class="bottom-bar">
+      <button id="saveFlow" class="primary">💾 Save Flow</button>
+      <button id="discardChanges">Discard Changes</button>
+      <div class="spacer"></div>
+      <span id="status" class="status"></span>
+    </div>
+  </main>
+
+  <template id="step-template">
+    <article class="step-card">
+      <div class="step-header">
+        <span class="step-title"></span>
+        <div class="step-actions">
+          <button type="button" class="icon" data-action="up" title="Move up">↑</button>
+          <button type="button" class="icon" data-action="down" title="Move down">↓</button>
+          <button type="button" class="icon danger" data-action="delete" title="Remove step">✕</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Step type</label>
+        <select class="step-type"></select>
+      </div>
+      <div class="step-fields"></div>
+    </article>
+  </template>
+
+  <script src="options.js"></script>
+</body>
+</html>
