@@ -1,9 +1,9 @@
 {
   "name": "AutoFiller Flow Runner",
-  "version": "1.0.14",
+  "version": "1.0.16",
   "manifest_version": 3,
   "description": "Runs predefined automation flow steps on websites.",
-  "permissions": ["storage", "scripting", "activeTab", "tabs", "notifications", "offscreen"],
+  "permissions": ["storage", "scripting", "activeTab", "tabs", "notifications", "offscreen", "debugger"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "options_page": "options.html",

@@ -215,6 +215,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+// Native click fallback via Chrome DevTools Protocol (requires debugger permission)
+async function nativeClick(tabId, x, y) {
+  // Attach to debugger, dispatch mouse events, then detach
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x: Math.round(x), y: Math.round(y) });
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x: Math.round(x), y: Math.round(y) });
+  } catch (err) {
+    console.warn("[background] nativeClick failed:", err);
+  } finally {
+    try { await chrome.debugger.detach(target); } catch {}
+  }
+}
+
+// Handle native click requests from content
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "NATIVE_CLICK" && sender?.tab?.id && typeof msg.x === "number" && typeof msg.y === "number") {
+    (async () => {
+      try {
+        await nativeClick(sender.tab.id, msg.x, msg.y);
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e) });
+      }
+    })();
+    return true;
+  }
+});
+
 async function getActiveTabId() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab?.id || null;
