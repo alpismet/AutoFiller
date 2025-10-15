@@ -74,7 +74,6 @@
       border-radius: 6px;
     }
     button.icon.picker-btn {
-      width: 32px;
       font-size: 16px;
     }
     button.icon.picker-btn.active {
@@ -192,10 +191,25 @@
     }
     .field .input-row {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: 1fr auto auto;
       gap: 8px;
       align-items: center;
     }
+    /* Make picker and force toggles visually match the selector input */
+    .field .input-row .icon.picker-btn,
+    .field .input-row .toggle {
+      height: 34px; /* approximate input height */
+      width: 34px;  /* equal width */
+      min-width: 34px;
+      border-radius: 8px; /* match input border radius */
+      padding: 0;
+    }
+    .toggle {
+      display: grid;
+      place-items: center;
+      font-size: 14px;
+    }
+    .toggle.active { background: var(--accent); color: #fff; border-color: var(--accent); }
     .field:last-child { margin-bottom: 0; }
     .field label {
       font-size: 12px;
@@ -318,6 +332,12 @@
           <div class="setting-row">
             <label for="selectorWaitMs">Selector wait timeout (ms)</label>
             <input id="selectorWaitMs" type="number" min="0" step="100" placeholder="5000" />
+          </div>
+          <div class="setting-row">
+            <label>
+              <input id="useNativeClick" type="checkbox" />
+              Use native click fallback (shows a brief “debugging” banner)
+            </label>
           </div>
         </div>
       </div>

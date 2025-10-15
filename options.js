@@ -8,7 +8,8 @@ const DEFAULT_FLOW = [
 
 const DEFAULT_SETTINGS = Object.freeze({
   stepDelayMs: 300,
-  selectorWaitMs: 5000
+  selectorWaitMs: 5000,
+  useNativeClick: false
 });
 
 const RUN_STATUS_META = {
@@ -91,7 +92,8 @@ const els = {
   tabSettings: document.getElementById("tab-settings"),
   // settings controls
   stepDelayMs: document.getElementById("stepDelayMs"),
-  selectorWaitMs: document.getElementById("selectorWaitMs")
+  selectorWaitMs: document.getElementById("selectorWaitMs"),
+  useNativeClick: document.getElementById("useNativeClick")
 };
 
 const state = {
@@ -227,6 +229,11 @@ function wireEvents() {
     }
   });
 
+  els.useNativeClick?.addEventListener("change", (e) => {
+    state.settings.useNativeClick = Boolean(e.target.checked);
+    setDirty(true, { silent: true });
+  });
+
 }
 
 async function loadFromStorage() {
@@ -257,6 +264,7 @@ function render() {
   // settings reflect
   if (els.stepDelayMs) els.stepDelayMs.value = String(state.settings.stepDelayMs ?? DEFAULT_SETTINGS.stepDelayMs);
   if (els.selectorWaitMs) els.selectorWaitMs.value = String(state.settings.selectorWaitMs ?? DEFAULT_SETTINGS.selectorWaitMs);
+  if (els.useNativeClick) els.useNativeClick.checked = Boolean(state.settings.useNativeClick ?? DEFAULT_SETTINGS.useNativeClick);
   updateEmptyState();
   setControlsDisabled(Boolean(state.pendingPicker));
   if (state.pendingPicker) {
@@ -367,6 +375,10 @@ async function runSingleStep(index) {
     // mark status pending for this step
     state.stepStatuses[index] = "pending";
     render();
+    // carry forceClick for Click steps
+    if (prepared.type === "Click") {
+      prepared.forceClick = Boolean(state.steps[index]?.forceClick);
+    }
     const res = await chrome.runtime.sendMessage({ type: "RUN_SINGLE_STEP", tabId: tab.id, step: prepared, index });
     if (!res?.ok) {
       state.stepStatuses[index] = "error";
@@ -399,6 +411,9 @@ function buildFields(container, schema, step, stepIndex) {
     let input;
     if (field.type === "textarea") {
       input = document.createElement("textarea");
+    } else if (field.type === "checkbox") {
+      input = document.createElement("input");
+      input.type = "checkbox";
     } else {
       input = document.createElement("input");
       input.type = field.type === "number" ? "number" : field.type === "url" ? "url" : "text";
@@ -412,17 +427,33 @@ function buildFields(container, schema, step, stepIndex) {
     }
 
     const existing = step[field.key];
-    if (existing !== undefined && existing !== null) {
-      input.value = String(existing);
-    } else if (field.default !== undefined) {
-      input.value = String(field.default);
+    if (field.type === "checkbox") {
+      if (existing !== undefined && existing !== null) {
+        input.checked = Boolean(existing);
+      } else if (field.default !== undefined) {
+        input.checked = Boolean(field.default);
+      }
+    } else {
+      if (existing !== undefined && existing !== null) {
+        input.value = String(existing);
+      } else if (field.default !== undefined) {
+        input.value = String(field.default);
+      }
     }
 
-    input.addEventListener("input", (event) => {
-      const rawValue = event.target.value;
-      setDirty(true, { silent: true });
-      updateFieldValue(stepIndex, field, rawValue);
-    });
+    if (field.type === "checkbox") {
+      input.addEventListener("change", (event) => {
+        const rawValue = Boolean(event.target.checked);
+        setDirty(true, { silent: true });
+        updateFieldValue(stepIndex, field, rawValue);
+      });
+    } else {
+      input.addEventListener("input", (event) => {
+        const rawValue = event.target.value;
+        setDirty(true, { silent: true });
+        updateFieldValue(stepIndex, field, rawValue);
+      });
+    }
 
     let inputHost = input;
     if (field.supportsPicker) {
@@ -441,6 +472,31 @@ function buildFields(container, schema, step, stepIndex) {
       });
       row.appendChild(input);
       row.appendChild(btn);
+
+      // Add Force toggle next to selector for Click steps
+      const stepObj = state.steps[stepIndex];
+      const isClickSelector = stepObj?.type === "Click" && field.key === "selector";
+      if (isClickSelector) {
+        const forceBtn = document.createElement("button");
+        forceBtn.type = "button";
+        forceBtn.className = "toggle";
+        forceBtn.title = "Force";
+        forceBtn.setAttribute("aria-label", "Force click (native)");
+        forceBtn.textContent = "⚡";
+        const applyForceState = () => {
+          const active = Boolean(state.steps[stepIndex]?.forceClick);
+          forceBtn.classList.toggle("active", active);
+          forceBtn.setAttribute("aria-pressed", String(active));
+        };
+        applyForceState();
+        forceBtn.addEventListener("click", () => {
+          const cur = Boolean(state.steps[stepIndex]?.forceClick);
+          state.steps[stepIndex].forceClick = !cur;
+          applyForceState();
+          setDirty(true, { silent: true });
+        });
+        row.appendChild(forceBtn);
+      }
       inputHost = row;
       if (isActive) {
         fieldWrapper.classList.add("picking");
@@ -506,6 +562,9 @@ function updateStepType(index, newType) {
     }
   });
   next.type = newType;
+  if (newType === "Click" && current.forceClick !== undefined) {
+    next.forceClick = current.forceClick;
+  }
   state.steps[index] = next;
 }
 
@@ -524,6 +583,9 @@ function createStepFromSchema(schema) {
       base[field.key] = field.type === "number" ? "" : "";
     }
   });
+  if (schema.type === "Click") {
+    base.forceClick = false;
+  }
   return base;
 }
 
@@ -653,6 +715,10 @@ function validateAndPrepare() {
         prepared[field.key] = typeof value === "string" ? value.trim() : value;
       }
     });
+    // carry per-step extras
+    if (step.type === "Click" && step.forceClick !== undefined) {
+      prepared.forceClick = Boolean(step.forceClick);
+    }
     preparedSteps.push(prepared);
   });
 
@@ -770,6 +836,10 @@ function sanitizeFlowArray(value) {
         normalized[field.key] = field.default;
       }
     });
+    // carry non-schema extras
+    if (step.type === "Click" && step.forceClick !== undefined) {
+      normalized.forceClick = Boolean(step.forceClick);
+    }
     sanitized.push(normalized);
   });
   return sanitized;
@@ -782,10 +852,11 @@ function cloneFlow(flow) {
 function exportFlow() {
   const prepared = validateAndPrepare();
   if (!prepared) return;
-  const payload = {
-    name: prepared.flowName,
-    steps: prepared.steps
-  };
+  const stepsOut = prepared.steps.map((s, i) => {
+    const src = state.steps[i] || {};
+    return s.type === "Click" && src.forceClick !== undefined ? { ...s, forceClick: Boolean(src.forceClick) } : s;
+  });
+  const payload = { name: prepared.flowName, steps: stepsOut };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");

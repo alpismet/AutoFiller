@@ -369,8 +369,18 @@ async function handleRunStep(step) {
                 const base = await waitForSelectorSafe(step.selector, timeout);
                 if (!base) return { ok: false, error: "selector_not_found" };
                 const el = findClickable(base);
-                // Respond first, then perform a robust synthetic click
-                setTimeout(() => { try { robustClick(el); } catch {} }, 0);
+                // Respond first, then perform click respecting per-step forceClick or global setting
+                setTimeout(() => {
+                    try {
+                        const rect = el.getBoundingClientRect();
+                        const cx = rect.left + Math.max(1, rect.width) / 2;
+                        const cy = rect.top + Math.max(1, rect.height) / 2;
+                        const useNative = Boolean(step.forceClick || step.useNativeClick);
+                        // When forcing/native allowed, robustClick attempts native first and falls back to synthetic
+                        // Otherwise, still use the hardened synthetic sequence
+                        if (useNative) robustClick(el); else syntheticClick(el, cx, cy);
+                    } catch {}
+                }, 0);
                 return { ok: true };
             }
 

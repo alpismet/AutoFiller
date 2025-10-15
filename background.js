@@ -25,7 +25,9 @@ const STEP_SANITIZERS = {
   Click(step) {
     const selector = typeof step.selector === "string" ? step.selector.trim() : "";
     if (!selector) return null;
-    return { type: "Click", selector };
+    const out = { type: "Click", selector };
+    if (step.forceClick !== undefined) out.forceClick = Boolean(step.forceClick);
+    return out;
   },
   FillText(step) {
     const selector = typeof step.selector === "string" ? step.selector.trim() : "";
@@ -88,12 +90,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await ensureContentScript(targetTabId);
 
         // settings
-        let settings = { selectorWaitMs: 5000 };
+  let settings = { selectorWaitMs: 5000, useNativeClick: false };
         try { const s = await chrome.storage.local.get(["settings"]); settings = { ...settings, ...(s?.settings || {}) }; } catch {}
 
         const index = typeof msg.index === "number" ? msg.index : -1;
         if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "running" });
-        const step = sanitizeStep(msg.step) || msg.step;
+  const step = sanitizeStep(msg.step) || msg.step;
         if (!step) { sendResponse({ ok: false, error: "Invalid step" }); if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "error" }); return; }
 
         if (step.type === "GoToURL") {
@@ -104,7 +106,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           await ensureContentScript(targetTabId);
         } else {
           await ensureContentScript(targetTabId);
-          const res = await chrome.tabs.sendMessage(targetTabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs } });
+          const res = await chrome.tabs.sendMessage(targetTabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(msg?.step?.forceClick) } });
           if (res && res.ok === false) throw new Error(res.error || "step_failed");
         }
         if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "success" });
@@ -281,7 +283,7 @@ async function ensureContentScript(tabId) {
 
 async function runFlow(flow, tabId) {
   // read settings
-  let settings = { stepDelayMs: 300, selectorWaitMs: 5000 };
+  let settings = { stepDelayMs: 300, selectorWaitMs: 5000, useNativeClick: false };
   try {
     const s = await chrome.storage.local.get(["settings"]);
     settings = { ...settings, ...(s?.settings || {}) };
@@ -303,7 +305,7 @@ async function runFlow(flow, tabId) {
         await ensureContentScript(tabId);
       } else {
         await ensureContentScript(tabId);
-        const res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs } });
+  const res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(step.forceClick) } });
         // optional: evaluate res
       }
       broadcastToOptions({ type: "FLOW_STATUS", index: i, status: "success" });
