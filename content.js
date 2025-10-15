@@ -368,7 +368,8 @@ async function handleRunStep(step) {
                 const timeout = Number(step.selectorWaitMs) || 5000;
                 const el = await waitForSelectorSafe(step.selector, timeout);
                 if (!el) return { ok: false, error: "selector_not_found" };
-                el.click();
+                // Respond first, then perform the click to avoid losing the port on navigation
+                setTimeout(() => { try { el.click(); } catch {} }, 0);
                 return { ok: true };
             }
 
