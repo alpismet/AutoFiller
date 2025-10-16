@@ -9,8 +9,7 @@ const DEFAULT_FLOW = [
 const DEFAULT_SETTINGS = Object.freeze({
   stepDelayMs: 300,
   selectorWaitMs: 5000,
-  useNativeClick: false,
-  mailslurpApiKey: ""
+  useNativeClick: false
 });
 
 const RUN_STATUS_META = {
@@ -71,19 +70,14 @@ const STEP_LIBRARY = [
   }
   ,
   {
-    type: "WaitForEmailCode",
-    label: "Wait for Email Code",
-    description: "Fetch a verification code from email (MailSlurp or manual prompt).",
+    type: "WaitForEmailGmail",
+    label: "Wait for Email (Gmail)",
+    description: "Poll Gmail with a search query and extract a 6-digit code.",
     fields: [
-      { key: "provider", label: "Provider", type: "select", required: true, options: [
-        { value: "manual", label: "Manual Prompt" },
-        { value: "mailslurp", label: "MailSlurp" }
-      ], default: "manual" },
-      { key: "inboxId", label: "MailSlurp Inbox ID", type: "text", placeholder: "00000000-0000-0000-0000-000000000000" },
-      { key: "regex", label: "Extraction Regex (group 1)", type: "text", placeholder: "\\b(\\d{4,8})\\b", default: "\\b(\\d{4,8})\\b" },
-      { key: "variable", label: "Save as variable", type: "text", required: true, placeholder: "otp", default: "otp" },
+      { key: "subject", label: "Email subject contains", type: "text", required: true, placeholder: "code" },
       { key: "timeoutMs", label: "Timeout (ms)", type: "number", placeholder: "120000", min: 1000, step: 500, default: 120000 },
-      { key: "promptMessage", label: "Manual prompt message", type: "text", placeholder: "Enter the code you received" }
+      { key: "pollMs", label: "Poll interval (ms)", type: "number", placeholder: "5000", min: 500, step: 500, default: 5000 },
+      { key: "variable", label: "Save as variable", type: "text", required: true, placeholder: "otp", default: "otp" }
     ]
   }
 ];
@@ -112,7 +106,10 @@ const els = {
   stepDelayMs: document.getElementById("stepDelayMs"),
   selectorWaitMs: document.getElementById("selectorWaitMs"),
   useNativeClick: document.getElementById("useNativeClick"),
-  mailslurpApiKey: document.getElementById("mailslurpApiKey")
+  gmailClientId: document.getElementById("gmailClientId"),
+  connectGmailBtn: document.getElementById("connectGmailBtn"),
+  testWaitForEmailGmailBtn: document.getElementById("testWaitForEmailGmailBtn"),
+  gmailStatus: document.getElementById("gmailStatus")
 };
 
 const state = {
@@ -253,10 +250,44 @@ function wireEvents() {
     setDirty(true, { silent: true });
   });
 
-  els.mailslurpApiKey?.addEventListener("input", (e) => {
-    state.settings.mailslurpApiKey = e.target.value.trim();
+  els.gmailClientId?.addEventListener("input", (e) => {
+    const v = e.target.value.trim();
+    state.settings.gmailClientId = v;
     setDirty(true, { silent: true });
   });
+
+  els.connectGmailBtn?.addEventListener("click", async () => {
+    try {
+      const clientId = state.settings.gmailClientId?.trim();
+      if (!clientId) { alert("Enter Gmail OAuth Client ID in Settings"); return; }
+      const res = await chrome.runtime.sendMessage({ type: "GMAIL_CONNECT", clientId });
+      if (!res?.ok) { alert("Gmail connect failed: " + (res?.error || "unknown")); return; }
+      els.gmailStatus.textContent = `Connected as ${res.email || 'account'}`;
+      showStatus("Gmail connected.");
+    } catch (err) {
+      console.error("[options] Gmail connect error:", err);
+      alert("Gmail connect error: " + err.message);
+    }
+  });
+
+  els.testWaitForEmailGmailBtn?.addEventListener("click", async () => {
+    try {
+      const subject = prompt("Email subject contains", "code");
+      if (subject == null) return;
+      const res = await chrome.runtime.sendMessage({ type: "TEST_WAIT_FOR_EMAIL_GMAIL", subject, timeoutMs: 60000, pollMs: 5000 });
+      if (res?.ok) {
+        console.log("[Test] Gmail code:", res.value);
+        alert("Code: " + res.value);
+      } else {
+        alert("No code found: " + (res?.error || "unknown"));
+      }
+    } catch (err) {
+      console.error("[options] Test WaitForEmailGmail error:", err);
+      alert("Test error: " + err.message);
+    }
+  });
+
+  // removed: mailslurp API key
 
 }
 
@@ -289,7 +320,18 @@ function render() {
   if (els.stepDelayMs) els.stepDelayMs.value = String(state.settings.stepDelayMs ?? DEFAULT_SETTINGS.stepDelayMs);
   if (els.selectorWaitMs) els.selectorWaitMs.value = String(state.settings.selectorWaitMs ?? DEFAULT_SETTINGS.selectorWaitMs);
   if (els.useNativeClick) els.useNativeClick.checked = Boolean(state.settings.useNativeClick ?? DEFAULT_SETTINGS.useNativeClick);
-  if (els.mailslurpApiKey) els.mailslurpApiKey.value = String(state.settings.mailslurpApiKey ?? "");
+  if (els.gmailClientId) els.gmailClientId.value = String(state.settings.gmailClientId ?? "");
+  if (els.gmailStatus) {
+    const conn = state.settings.gmailConnection?.email;
+    if (conn) {
+      const text = `Connected as ${conn}`;
+      els.gmailStatus.textContent = text;
+      els.gmailStatus.title = text;
+    } else {
+      els.gmailStatus.textContent = "Not connected";
+      els.gmailStatus.title = "Not connected";
+    }
+  }
   updateEmptyState();
   setControlsDisabled(Boolean(state.pendingPicker));
   if (state.pendingPicker) {

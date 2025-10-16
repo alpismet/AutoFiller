@@ -46,16 +46,19 @@ const STEP_SANITIZERS = {
   },
   WaitForEmailCode(step) {
     const out = { type: "WaitForEmailCode" };
-    const provider = typeof step.provider === "string" ? step.provider : "manual";
-    out.provider = provider;
-    if (provider === "mailslurp") {
-      if (typeof step.inboxId === "string") out.inboxId = step.inboxId.trim();
-    }
-    if (typeof step.regex === "string" && step.regex) out.regex = step.regex;
     out.variable = typeof step.variable === "string" && step.variable.trim() ? step.variable.trim() : "otp";
     const t = Number(step.timeoutMs);
-    if (Number.isFinite(t) && t > 0) out.timeoutMs = t; else out.timeoutMs = 120000;
+    out.timeoutMs = Number.isFinite(t) && t > 0 ? t : 120000;
     if (typeof step.promptMessage === "string") out.promptMessage = step.promptMessage;
+    return out;
+  }
+  ,
+  WaitForEmailGmail(step) {
+    const out = { type: "WaitForEmailGmail" };
+    out.subject = typeof step.subject === "string" ? step.subject : "";
+    const t = Number(step.timeoutMs); out.timeoutMs = Number.isFinite(t) && t > 0 ? t : 120000;
+    const p = Number(step.pollMs); out.pollMs = Number.isFinite(p) && p >= 500 ? p : 5000;
+    out.variable = typeof step.variable === "string" && step.variable.trim() ? step.variable.trim() : "otp";
     return out;
   }
 };
@@ -118,6 +121,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const cur = await getTabUrl(targetTabId);
           if (isForbiddenUrl(cur)) throw new Error("Target page is not scriptable: " + cur);
           await ensureContentScript(targetTabId);
+        } else if (step.type === "WaitForEmailCode") {
+         throw new Error("WaitForEmailCode is no longer supported.");
+        } else if (step.type === "WaitForEmailGmail") {
+          const res = await waitForEmailGmail(step);
+          if (!res?.ok) throw new Error(res?.error || "step_failed");
         } else {
           await ensureContentScript(targetTabId);
           const res = await chrome.tabs.sendMessage(targetTabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(msg?.step?.forceClick) } });
@@ -229,6 +237,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     try { sendResponse({ ok: true }); } catch {}
     return;
   }
+
+  if (msg.type === "GMAIL_CONNECT") {
+    (async () => {
+      try {
+        const res = await gmailConnect(msg.clientId);
+        sendResponse(res);
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message || e) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === "TEST_WAIT_FOR_EMAIL_GMAIL") {
+    (async () => {
+      try {
+        const out = await waitForEmailGmail({ subject: msg.subject || msg.query || "", timeoutMs: msg.timeoutMs || 60000, pollMs: msg.pollMs || 5000, variable: "otp" });
+        sendResponse(out);
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message || e) });
+      }
+    })();
+    return true;
+  }
 });
 
 // Native click fallback via Chrome DevTools Protocol (requires debugger permission)
@@ -321,7 +353,9 @@ async function runFlow(flow, tabId) {
         await ensureContentScript(tabId);
         let res = null;
         if (step.type === "WaitForEmailCode") {
-          res = await handleWaitForEmailCode(step, tabId);
+         throw new Error("WaitForEmailCode is no longer supported.");
+        } else if (step.type === "WaitForEmailGmail") {
+          res = await waitForEmailGmail(step);
         } else {
           res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(step.forceClick) } });
         }
@@ -339,65 +373,185 @@ async function runFlow(flow, tabId) {
   }
 }
 
-async function handleWaitForEmailCode(step, tabId) {
-  const provider = step.provider || "manual";
-  if (provider === "mailslurp") {
-    try {
-      const { settings } = await chrome.storage.local.get(["settings"]);
-      const apiKey = settings?.mailslurpApiKey || "";
-      if (!apiKey) throw new Error("Missing MailSlurp API key in Settings");
-      const inboxId = step.inboxId;
-      if (!inboxId) throw new Error("Missing MailSlurp Inbox ID");
-      const timeoutMs = Number(step.timeoutMs) || 120000;
-      const pollMs = 3000;
-      const until = Date.now() + timeoutMs;
-      let code = null;
-      const regex = new RegExp(step.regex || "(\\d{4,8})");
-      while (Date.now() < until && !code) {
-        const email = await mailslurpFetchLatest(apiKey, inboxId);
-        if (email) {
-          const text = `${email.subject || ""}\n${email.body || ""}`;
-          const m = regex.exec(text);
-          if (m && m[1]) code = m[1];
-        }
-        if (!code) await wait(pollMs);
+async function gmailConnect(clientId) {
+  // Use pathless redirect URI per Google recommendation for extensions
+  const REDIRECT_URI = `https://${chrome.runtime.id}.chromiumapp.org/`;
+  const params = new URLSearchParams({
+    client_id: clientId,
+    response_type: "token",
+  redirect_uri: REDIRECT_URI,
+    scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email openid",
+    include_granted_scopes: "true",
+    prompt: "consent"
+  });
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+  const respUrl = await chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true });
+  const hash = new URL(respUrl).hash.replace(/^#/, "");
+  const data = new URLSearchParams(hash);
+  const access_token = data.get("access_token");
+  const expires_in = Number(data.get("expires_in")) || 3600;
+  if (!access_token) throw new Error("No access_token");
+  const who = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", { headers: { Authorization: `Bearer ${access_token}` } }).then(r => r.json()).catch(() => ({}));
+  const email = who?.email || "unknown";
+  const expires_at = Date.now() + expires_in * 1000 - 5000;
+  const gmail = { access_token, expires_at, email, client_id: clientId };
+  const { settings } = await chrome.storage.local.get(["settings"]);
+  const next = { ...(settings || {}), gmailClientId: clientId, gmailConnection: gmail };
+  await chrome.storage.local.set({ settings: next });
+  return { ok: true, email };
+}
+
+async function ensureGmailToken() {
+  const { settings } = await chrome.storage.local.get(["settings"]);
+  const conn = settings?.gmailConnection;
+  if (!conn?.access_token) throw new Error("Gmail not connected");
+  if (Date.now() < (conn.expires_at || 0)) return conn.access_token;
+  // token expired: require reconnect (or implement refresh if using code flow)
+  throw new Error("Gmail token expired. Reconnect.");
+}
+
+async function waitForEmailGmail(step) {
+  const token = await ensureGmailToken();
+  const timeoutMs = Number(step.timeoutMs) || 120000;
+  const pollMs = Number(step.pollMs) || 5000;
+  const until = Date.now() + timeoutMs;
+  const re = /(\d{6})/; // default 6-digit OTP
+  const startedAt = Date.now();
+  while (Date.now() < until) {
+    const msg = await gmailFetchLatestByQuery(token, { subject: step.subject || "", newerThanMs: startedAt });
+    if (msg) {
+      const combined = [msg.snippet || "", msg.body || ""].join("\n");
+      const normalized = normalizeTextForOtp(combined);
+      // Try several patterns: exact 6 digits, 4-8 digits, and 6 digits with optional separators
+      const patterns = [
+        /(\b\d{6}\b)/,
+        /(\b\d{4,8}\b)/,
+        /(\d[\s\-]??\d[\s\-]??\d[\s\-]??\d[\s\-]??\d[\s\-]??\d)/
+      ];
+      let found = null;
+      for (const pat of patterns) {
+        const m = pat.exec(normalized);
+        if (m && m[1]) { found = m[1]; break; }
       }
-      if (!code) throw new Error("Email code not found in time");
-      await saveVariable(step.variable || "otp", code);
-      return { ok: true, value: code };
-    } catch (e) {
-      return { ok: false, error: String(e?.message || e) };
+      if (found) {
+        const digits = String(found).replace(/\D/g, "");
+        const code = digits.length >= 6 ? digits.slice(-6) : digits;
+        await saveVariable(step.variable || "otp", code);
+        return { ok: true, value: code };
+      }
     }
+    await wait(pollMs);
   }
-  // manual provider: delegate to content to prompt user
+  return { ok: false, error: "code_not_found" };
+}
+
+async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } = {}) {
+  const base = "https://gmail.googleapis.com/gmail/v1/users/me";
+  // Build query: subject contains and newer_than:Xm from now. Gmail doesn't accept exact timestamps in q param,
+  // so we approximate with minutes since start. Minimum 1m.
+  const minutes = Math.max(1, Math.ceil((Date.now() - newerThanMs) / 60000));
+  const qParts = [];
+  if (subject && subject.trim()) qParts.push(`subject:(${subject.trim()})`);
+  qParts.push(`newer_than:${minutes}m`);
+  qParts.push(`in:inbox`);
+  const q = qParts.join(" ");
+  const listUrl = `${base}/messages?q=${encodeURIComponent(q)}&maxResults=5`;
+  const list = await fetch(listUrl, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json());
+  const items = Array.isArray(list?.messages) ? list.messages : [];
+  if (!items.length) return null;
+  // Fetch a few and pick the newest with usable text
+  const details = await Promise.all(items.slice(0, 5).map(async (m) => {
+    const msg = await fetch(`${base}/messages/${m.id}?format=full`, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json());
+    const text = extractMessageText(msg);
+    const internalDate = Number(msg?.internalDate) || 0;
+    // Ensure subject actually matches when provided (server-side subject:(...) is best-effort contains)
+    const headers = Array.isArray(msg?.payload?.headers) ? msg.payload.headers : [];
+    const subj = headers.find(h => (h.name || "").toLowerCase() === "subject")?.value || "";
+    const subjectOk = !subject || subj.toLowerCase().includes(subject.toLowerCase());
+    const timeOk = !newerThanMs || internalDate >= newerThanMs;
+    return { id: m.id, snippet: msg?.snippet || "", text, internalDate, subjectOk, timeOk };
+  }));
+  const filtered = details.filter(d => d.subjectOk && d.timeOk && (d.text || d.snippet));
+  if (!filtered.length) return null; // no qualifying messages yet; keep polling
+  filtered.sort((a, b) => b.internalDate - a.internalDate);
+  const top = filtered[0];
+  return { snippet: top?.snippet || "", body: top?.text || "" };
+}
+
+function extractMessageText(msg) {
+  const payload = msg?.payload;
+  if (!payload) return "";
+  const texts = [];
+  const htmls = [];
+  const collect = (part) => {
+    if (!part) return;
+    if (part.parts && Array.isArray(part.parts)) {
+      part.parts.forEach(collect);
+    }
+    const mt = part.mimeType || "";
+    const data = part?.body?.data;
+    if (!data && !part?.body?.attachmentId) return; // skip empty
+    const decoded = data ? decodeBase64UrlToString(data) : ""; // attachments skipped for now
+    if (mt.startsWith("text/plain")) {
+      texts.push(decoded);
+    } else if (mt.startsWith("text/html")) {
+      htmls.push(decoded);
+    } else if (!mt && decoded) {
+      // Some providers put raw body at root without mimeType
+      texts.push(decoded);
+    }
+  };
+  collect(payload);
+  const htmlText = htmls.map(htmlToText).join("\n");
+  return [texts.join("\n"), htmlText].filter(Boolean).join("\n");
+}
+
+function decodeBase64UrlToString(data) {
   try {
-    const res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { type: "PromptForCode", message: step.promptMessage || "Enter the code you received" } });
-    if (res?.ok && res.value) {
-      await saveVariable(step.variable || "otp", res.value);
-      return { ok: true, value: res.value };
+    const s = data.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = s.length % 4 ? 4 - (s.length % 4) : 0;
+    const b64 = s + "=".repeat(pad);
+    const binary = atob(b64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    if (typeof TextDecoder !== "undefined") {
+      return new TextDecoder("utf-8").decode(bytes);
     }
-    return { ok: false, error: res?.error || "prompt_cancelled" };
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+    return out;
   } catch (e) {
-    return { ok: false, error: String(e) };
+    console.warn("[background] base64url decode failed", e);
+    return "";
   }
 }
 
-async function mailslurpFetchLatest(apiKey, inboxId) {
-  const base = "https://api.mailslurp.com";
-  // get latest email for inbox
-  const listUrl = `${base}/inboxes/${encodeURIComponent(inboxId)}/emails?size=1&sort=DESC`;
-  const list = await fetchJson(listUrl, apiKey);
-  const item = Array.isArray(list?.content) && list.content[0];
-  if (!item?.id) return null;
-  const email = await fetchJson(`${base}/emails/${encodeURIComponent(item.id)}`, apiKey);
-  return { subject: email?.subject || "", body: email?.body || email?.text || "" };
+function htmlToText(html) {
+  if (!html) return "";
+  // strip scripts/styles and tags
+  const cleaned = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+  return cleaned;
 }
 
-async function fetchJson(url, apiKey) {
-  const res = await fetch(url, { headers: { "Content-Type": "application/json", "x-api-key": apiKey } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+function normalizeTextForOtp(text) {
+  if (!text) return "";
+  return String(text)
+    // remove zero-width and non-printing characters
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    // collapse whitespace
+    .replace(/\s+/g, " ")
+    .trim();
 }
+
+// Removed handleWaitForEmailCode function as it is no longer needed.
 
 async function saveVariable(name, value) {
   const key = "variables";
