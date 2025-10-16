@@ -43,7 +43,8 @@ const STEP_LIBRARY = [
     description: "Type into an input matching the selector.",
     fields: [
       { key: "selector", label: "CSS Selector", type: "text", required: true, placeholder: "input[name='email']", supportsPicker: true },
-      { key: "value", label: "Value", type: "textarea", required: true, placeholder: "hello@example.com" }
+      { key: "value", label: "Value", type: "textarea", required: true, placeholder: "hello@example.com" },
+      { key: "splitAcrossInputs", label: "Split value across multiple inputs", type: "checkbox", default: false }
     ]
   },
   {
@@ -469,6 +470,11 @@ function buildFields(container, schema, step, stepIndex) {
   if (!schema) return;
 
   schema.fields.forEach((field) => {
+    // Hide the dedicated checkbox field for FillText split since we expose an inline toggle next to selector
+    if (schema.type === "FillText" && field.key === "splitAcrossInputs") {
+      // Ensure the value remains in the step object via defaults/sanitization, but don't render a separate UI control
+      return;
+    }
     const fieldWrapper = document.createElement("div");
     fieldWrapper.className = "field";
 
@@ -584,6 +590,30 @@ function buildFields(container, schema, step, stepIndex) {
         });
         row.appendChild(forceBtn);
       }
+
+      // Add Split toggle next to selector for FillText steps (one char per input)
+      const isFillTextSelector = stepObj?.type === "FillText" && field.key === "selector";
+      if (isFillTextSelector) {
+        const splitBtn = document.createElement("button");
+        splitBtn.type = "button";
+        splitBtn.className = "toggle";
+        splitBtn.title = "Split across multiple inputs";
+        splitBtn.setAttribute("aria-label", "Split value across multiple inputs");
+        splitBtn.textContent = "🔢";
+        const applySplitState = () => {
+          const active = Boolean(state.steps[stepIndex]?.splitAcrossInputs);
+          splitBtn.classList.toggle("active", active);
+          splitBtn.setAttribute("aria-pressed", String(active));
+        };
+        applySplitState();
+        splitBtn.addEventListener("click", () => {
+          const cur = Boolean(state.steps[stepIndex]?.splitAcrossInputs);
+          state.steps[stepIndex].splitAcrossInputs = !cur;
+          applySplitState();
+          setDirty(true, { silent: true });
+        });
+        row.appendChild(splitBtn);
+      }
       inputHost = row;
       if (isActive) {
         fieldWrapper.classList.add("picking");
@@ -592,8 +622,56 @@ function buildFields(container, schema, step, stepIndex) {
       }
     }
 
-    fieldWrapper.appendChild(label);
-    fieldWrapper.appendChild(inputHost);
+    // If this is the Gmail step's variable field, append a small badge with the current stored value
+    if (schema.type === "WaitForEmailGmail" && field.key === "variable") {
+      const row = document.createElement("div");
+      row.className = "input-row";
+      row.appendChild(inputHost);
+      const badge = document.createElement("span");
+      badge.className = "mini-badge"; // relies on existing styles; otherwise minimal inline
+      badge.title = "Current variable value";
+      const applyBadge = async () => {
+        try {
+          const key = (state.steps[stepIndex]?.variable || "otp").trim() || "otp";
+          const data = await chrome.storage.local.get(["variables"]);
+          const v = data?.variables?.[key];
+          if (v == null || String(v) === "") {
+            badge.textContent = "(empty)";
+            badge.style.opacity = "0.6";
+          } else {
+            badge.textContent = String(v);
+            badge.style.opacity = "1";
+          }
+        } catch {
+          badge.textContent = "(n/a)";
+          badge.style.opacity = "0.6";
+        }
+      };
+      // initial value
+      applyBadge();
+      // update when input changes (variable name changed)
+      const baseSet = inputHost;
+      const inputEl = baseSet instanceof HTMLElement ? baseSet.querySelector("input,textarea,select") || baseSet : baseSet;
+      if (inputEl && inputEl.addEventListener) {
+        inputEl.addEventListener("input", () => {
+          // defer to allow state update
+          setTimeout(applyBadge, 0);
+        });
+      }
+      // listen storage changes to refresh live
+      const onChanged = (changes, area) => {
+        if (area !== "local" || !changes.variables) return;
+        applyBadge();
+      };
+      try { chrome.storage.onChanged.addListener(onChanged); } catch {}
+      // best-effort cleanup when re-rendering: rely on re-render to replace nodes
+      row.appendChild(badge);
+      fieldWrapper.appendChild(label);
+      fieldWrapper.appendChild(row);
+    } else {
+      fieldWrapper.appendChild(label);
+      fieldWrapper.appendChild(inputHost);
+    }
     container.appendChild(fieldWrapper);
   });
 }

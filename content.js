@@ -391,14 +391,57 @@ async function handleRunStep(step) {
 
             case "FillText": {
                 const timeout = Number(step.selectorWaitMs) || 5000;
-                const el = await waitForSelectorSafe(step.selector, timeout);
-                if (!el) return { ok: false, error: "selector_not_found" };
-                el.focus();
                 const value = await resolveVariablesInText(step.value);
-                el.value = value;
-                el.dispatchEvent(new Event("input", { bubbles: true }));
-                el.dispatchEvent(new Event("change", { bubbles: true }));
-                return { ok: true };
+                if (step.splitAcrossInputs) {
+                    const nodes = await waitForAllSelectors(step.selector, timeout);
+                    if (!nodes.length) return { ok: false, error: "selector_not_found" };
+                        // Prefer real input-like elements
+                        let inputs = Array.from(nodes).filter(n => n && n.nodeType === Node.ELEMENT_NODE && (n.matches?.('input,textarea,[contenteditable="true"]') || 'value' in n));
+                        // If selector points to container(s) (e.g., div.grid.grid-cols-6), search for input-like descendants
+                        if (!inputs.length) {
+                            const descendant = [];
+                            Array.from(nodes).forEach((container) => {
+                                try {
+                                    const found = container.querySelectorAll('input,textarea,[contenteditable="true"]');
+                                    descendant.push(...Array.from(found));
+                                } catch {}
+                            });
+                            inputs = descendant.filter(n => n && n.nodeType === Node.ELEMENT_NODE);
+                        }
+                        // Optionally prioritize one-char OTP fields
+                        if (inputs.length) {
+                            inputs.sort((a, b) => {
+                                const aMax = Number(a.getAttribute?.('maxlength')) || 0;
+                                const bMax = Number(b.getAttribute?.('maxlength')) || 0;
+                                const aScore = aMax === 1 ? 0 : 1;
+                                const bScore = bMax === 1 ? 0 : 1;
+                                return aScore - bScore; // maxlength=1 first
+                            });
+                        }
+                        if (!inputs.length) return { ok: false, error: "selector_not_found" };
+                    // Distribute characters across inputs
+                    let i = 0;
+                    // Use only digits when available (OTP style). If no digits, fall back to all characters.
+                    const onlyDigits = String(value).match(/\d/g);
+                    const chars = onlyDigits && onlyDigits.length ? onlyDigits : Array.from(String(value));
+                    for (let idx = 0; idx < inputs.length; idx++) {
+                        const node = inputs[idx];
+                        const ch = chars[i] ?? "";
+                        focusAndSetValue(node, ch);
+                        // attempt to auto-advance focus for OTP UX
+                        if (ch && idx + 1 < inputs.length) {
+                            try { inputs[idx + 1].focus(); } catch {}
+                        }
+                        i += 1;
+                        if (i >= chars.length) break;
+                    }
+                    return { ok: true };
+                } else {
+                    const el = await waitForSelectorSafe(step.selector, timeout);
+                    if (!el) return { ok: false, error: "selector_not_found" };
+                    focusAndSetValue(el, value);
+                    return { ok: true };
+                }
             }
 
             case "Wait":
@@ -508,6 +551,63 @@ async function waitForSelectorSafe(selector, timeoutMs) {
         await sleep(poll);
     }
     return null;
+}
+
+async function waitForAllSelectors(selector, timeoutMs) {
+    if (!selector || typeof selector !== "string") return [];
+    const start = Date.now();
+    const poll = 100;
+    while (Date.now() - start <= timeoutMs) {
+        try {
+            const list = document.querySelectorAll(selector);
+            if (list && list.length) return list;
+        } catch {}
+        await sleep(poll);
+    }
+    return [];
+}
+
+function focusAndSetValue(el, value) {
+    if (!(el instanceof Element)) return;
+    try { el.focus(); } catch {}
+    const tag = el.tagName?.toLowerCase();
+    const type = (el.getAttribute && el.getAttribute('type') || '').toLowerCase();
+    const setNativeValue = (element, v) => {
+        try {
+            const proto = element.tagName?.toLowerCase() === 'textarea' ? TextAreaElementPrototype() : HTMLInputElement.prototype;
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && typeof desc.set === 'function') {
+                desc.set.call(element, v);
+                return true;
+            }
+        } catch {}
+        try { element.value = v; return true; } catch {}
+        return false;
+    };
+    if (tag === 'input' || tag === 'textarea') {
+        setNativeValue(el, value);
+    } else if ('value' in el) {
+        // Fallback for custom elements
+        try { el.value = value; } catch {}
+    } else {
+        el.textContent = value;
+    }
+    // Try to simulate key events for single-character inputs (common in OTP)
+    const ch = String(value || '');
+    if (ch.length === 1 && (tag === 'input' || tag === 'textarea')) {
+        const key = ch;
+        const code = /\d/.test(ch) ? `Digit${ch}` : undefined;
+        try { el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key, code })); } catch {}
+        try { el.dispatchEvent(new KeyboardEvent('keypress', { bubbles: true, cancelable: true, key, code })); } catch {}
+        try { el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key, code })); } catch {}
+    }
+    try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+    try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+}
+
+// Helper to safely access TextAreaElement prototype across browsers
+function TextAreaElementPrototype() {
+    try { return HTMLTextAreaElement?.prototype || HTMLElement.prototype; } catch { return HTMLElement.prototype; }
 }
 
 function findClickable(node) {
