@@ -46,6 +46,16 @@ const STEP_SANITIZERS = {
   PlaySound() {
     return { type: "PlaySound" };
   },
+  SelectDropdown(step) {
+    const controlSelector = typeof step.controlSelector === "string" ? step.controlSelector.trim() : "";
+    const optionText = typeof step.optionText === "string" ? step.optionText.trim() : "";
+    if (!controlSelector || !optionText) return null;
+    const out = { type: "SelectDropdown", controlSelector, optionText };
+    if (typeof step.optionItemSelector === "string" && step.optionItemSelector.trim()) out.optionItemSelector = step.optionItemSelector.trim();
+    const t = Number(step.timeoutMs);
+    if (Number.isFinite(t) && t > 0) out.timeoutMs = t; else out.timeoutMs = 10000;
+    return out;
+  },
   
   WaitForEmailGmail(step) {
     const out = { type: "WaitForEmailGmail" };
