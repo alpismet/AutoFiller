@@ -33,7 +33,9 @@ const STEP_SANITIZERS = {
     const selector = typeof step.selector === "string" ? step.selector.trim() : "";
     if (!selector) return null;
     const value = step.value != null ? String(step.value) : "";
-    return { type: "FillText", selector, value };
+    const out = { type: "FillText", selector, value };
+    if (step.splitAcrossInputs !== undefined) out.splitAcrossInputs = Boolean(step.splitAcrossInputs);
+    return out;
   },
   EnsureAudio(step) {
     const timeout = Number(step.timeoutMs);
@@ -44,15 +46,7 @@ const STEP_SANITIZERS = {
   PlaySound() {
     return { type: "PlaySound" };
   },
-  WaitForEmailCode(step) {
-    const out = { type: "WaitForEmailCode" };
-    out.variable = typeof step.variable === "string" && step.variable.trim() ? step.variable.trim() : "otp";
-    const t = Number(step.timeoutMs);
-    out.timeoutMs = Number.isFinite(t) && t > 0 ? t : 120000;
-    if (typeof step.promptMessage === "string") out.promptMessage = step.promptMessage;
-    return out;
-  }
-  ,
+  
   WaitForEmailGmail(step) {
     const out = { type: "WaitForEmailGmail" };
     out.subject = typeof step.subject === "string" ? step.subject : "";
@@ -121,8 +115,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const cur = await getTabUrl(targetTabId);
           if (isForbiddenUrl(cur)) throw new Error("Target page is not scriptable: " + cur);
           await ensureContentScript(targetTabId);
-        } else if (step.type === "WaitForEmailCode") {
-         throw new Error("WaitForEmailCode is no longer supported.");
         } else if (step.type === "WaitForEmailGmail") {
           const res = await waitForEmailGmail(step);
           if (!res?.ok) throw new Error(res?.error || "step_failed");
@@ -352,9 +344,7 @@ async function runFlow(flow, tabId) {
       } else {
         await ensureContentScript(tabId);
         let res = null;
-        if (step.type === "WaitForEmailCode") {
-         throw new Error("WaitForEmailCode is no longer supported.");
-        } else if (step.type === "WaitForEmailGmail") {
+        if (step.type === "WaitForEmailGmail") {
           res = await waitForEmailGmail(step);
         } else {
           res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(step.forceClick) } });
@@ -422,11 +412,12 @@ async function waitForEmailGmail(step) {
     if (msg) {
       const combined = [msg.snippet || "", msg.body || ""].join("\n");
       const normalized = normalizeTextForOtp(combined);
-      // Try several patterns: exact 6 digits, 4-8 digits, and 6 digits with optional separators
+      // Try several patterns: exact 6 digits, common keywords around code, optional separators, then 4-8 digits fallback
       const patterns = [
-        /(\b\d{6}\b)/,
-        /(\b\d{4,8}\b)/,
-        /(\d[\s\-]??\d[\s\-]??\d[\s\-]??\d[\s\-]??\d[\s\-]??\d)/
+        /(\b\d{6}\b)/, // pure 6 digits
+        /(?:code|kod|otp|verification|doğrulama|guvenlik)\D{0,20}(\d{6})/i,
+        /(\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d)/,
+        /(\b\d{4,8}\b)/ // broader fallback
       ];
       let found = null;
       for (const pat of patterns) {
@@ -435,7 +426,7 @@ async function waitForEmailGmail(step) {
       }
       if (found) {
         const digits = String(found).replace(/\D/g, "");
-        const code = digits.length >= 6 ? digits.slice(-6) : digits;
+        let code = digits.length >= 6 ? digits.slice(-6) : digits;
         await saveVariable(step.variable || "otp", code);
         return { ok: true, value: code };
       }
@@ -450,30 +441,43 @@ async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } 
   // Build query: subject contains and newer_than:Xm from now. Gmail doesn't accept exact timestamps in q param,
   // so we approximate with minutes since start. Minimum 1m.
   const minutes = Math.max(1, Math.ceil((Date.now() - newerThanMs) / 60000));
-  const qParts = [];
-  if (subject && subject.trim()) qParts.push(`subject:(${subject.trim()})`);
-  qParts.push(`newer_than:${minutes}m`);
-  qParts.push(`in:inbox`);
-  const q = qParts.join(" ");
-  const listUrl = `${base}/messages?q=${encodeURIComponent(q)}&maxResults=5`;
-  const list = await fetch(listUrl, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json());
-  const items = Array.isArray(list?.messages) ? list.messages : [];
-  if (!items.length) return null;
-  // Fetch a few and pick the newest with usable text
-  const details = await Promise.all(items.slice(0, 5).map(async (m) => {
-    const msg = await fetch(`${base}/messages/${m.id}?format=full`, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json());
-    const text = extractMessageText(msg);
-    const internalDate = Number(msg?.internalDate) || 0;
-    // Ensure subject actually matches when provided (server-side subject:(...) is best-effort contains)
-    const headers = Array.isArray(msg?.payload?.headers) ? msg.payload.headers : [];
-    const subj = headers.find(h => (h.name || "").toLowerCase() === "subject")?.value || "";
-    const subjectOk = !subject || subj.toLowerCase().includes(subject.toLowerCase());
-    const timeOk = !newerThanMs || internalDate >= newerThanMs;
-    return { id: m.id, snippet: msg?.snippet || "", text, internalDate, subjectOk, timeOk };
-  }));
-  const filtered = details.filter(d => d.subjectOk && d.timeOk && (d.text || d.snippet));
-  if (!filtered.length) return null; // no qualifying messages yet; keep polling
-  filtered.sort((a, b) => b.internalDate - a.internalDate);
+  const buildQuery = (includeInbox) => {
+    const parts = [];
+    if (subject && subject.trim()) parts.push(`subject:(${subject.trim()})`);
+    parts.push(`newer_than:${minutes}m`);
+    if (includeInbox) parts.push(`in:inbox`);
+    return parts.join(" ");
+  };
+
+  const SKEW_MS = 120000; // allow 2 minutes clock skew around start time
+  const fetchAndFilter = async (includeInbox) => {
+    const q = buildQuery(includeInbox);
+    const listUrl = `${base}/messages?q=${encodeURIComponent(q)}&maxResults=5`;
+    const list = await fetch(listUrl, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json());
+    const items = Array.isArray(list?.messages) ? list.messages : [];
+    if (!items.length) return [];
+    const details = await Promise.all(items.slice(0, 5).map(async (m) => {
+      const msg = await fetch(`${base}/messages/${m.id}?format=full`, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json());
+      const text = extractMessageText(msg);
+      const internalDate = Number(msg?.internalDate) || 0;
+      const headers = Array.isArray(msg?.payload?.headers) ? msg.payload.headers : [];
+      const subj = headers.find(h => (h.name || "").toLowerCase() === "subject")?.value || "";
+      const subjectOk = !subject || subj.toLowerCase().includes(subject.toLowerCase());
+      const timeOk = !newerThanMs || internalDate >= (newerThanMs - SKEW_MS);
+      return { id: m.id, snippet: msg?.snippet || "", text, internalDate, subjectOk, timeOk };
+    }));
+    const filtered = details.filter(d => d.subjectOk && d.timeOk && (d.text || d.snippet));
+    filtered.sort((a, b) => b.internalDate - a.internalDate);
+    return filtered;
+  };
+
+  // Try with inbox scope first
+  let filtered = await fetchAndFilter(true);
+  // Fallback: search anywhere if nothing found yet
+  if (!filtered.length) {
+    filtered = await fetchAndFilter(false);
+  }
+  if (!filtered.length) return null;
   const top = filtered[0];
   return { snippet: top?.snippet || "", body: top?.text || "" };
 }
