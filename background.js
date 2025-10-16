@@ -43,6 +43,20 @@ const STEP_SANITIZERS = {
   },
   PlaySound() {
     return { type: "PlaySound" };
+  },
+  WaitForEmailCode(step) {
+    const out = { type: "WaitForEmailCode" };
+    const provider = typeof step.provider === "string" ? step.provider : "manual";
+    out.provider = provider;
+    if (provider === "mailslurp") {
+      if (typeof step.inboxId === "string") out.inboxId = step.inboxId.trim();
+    }
+    if (typeof step.regex === "string" && step.regex) out.regex = step.regex;
+    out.variable = typeof step.variable === "string" && step.variable.trim() ? step.variable.trim() : "otp";
+    const t = Number(step.timeoutMs);
+    if (Number.isFinite(t) && t > 0) out.timeoutMs = t; else out.timeoutMs = 120000;
+    if (typeof step.promptMessage === "string") out.promptMessage = step.promptMessage;
+    return out;
   }
 };
 
@@ -305,7 +319,12 @@ async function runFlow(flow, tabId) {
         await ensureContentScript(tabId);
       } else {
         await ensureContentScript(tabId);
-  const res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(step.forceClick) } });
+        let res = null;
+        if (step.type === "WaitForEmailCode") {
+          res = await handleWaitForEmailCode(step, tabId);
+        } else {
+          res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(step.forceClick) } });
+        }
         // optional: evaluate res
       }
       broadcastToOptions({ type: "FLOW_STATUS", index: i, status: "success" });
@@ -318,6 +337,73 @@ async function runFlow(flow, tabId) {
     const delay = Math.max(0, Number(settings.stepDelayMs) || 0);
     if (delay) await wait(delay);
   }
+}
+
+async function handleWaitForEmailCode(step, tabId) {
+  const provider = step.provider || "manual";
+  if (provider === "mailslurp") {
+    try {
+      const { settings } = await chrome.storage.local.get(["settings"]);
+      const apiKey = settings?.mailslurpApiKey || "";
+      if (!apiKey) throw new Error("Missing MailSlurp API key in Settings");
+      const inboxId = step.inboxId;
+      if (!inboxId) throw new Error("Missing MailSlurp Inbox ID");
+      const timeoutMs = Number(step.timeoutMs) || 120000;
+      const pollMs = 3000;
+      const until = Date.now() + timeoutMs;
+      let code = null;
+      const regex = new RegExp(step.regex || "(\\d{4,8})");
+      while (Date.now() < until && !code) {
+        const email = await mailslurpFetchLatest(apiKey, inboxId);
+        if (email) {
+          const text = `${email.subject || ""}\n${email.body || ""}`;
+          const m = regex.exec(text);
+          if (m && m[1]) code = m[1];
+        }
+        if (!code) await wait(pollMs);
+      }
+      if (!code) throw new Error("Email code not found in time");
+      await saveVariable(step.variable || "otp", code);
+      return { ok: true, value: code };
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e) };
+    }
+  }
+  // manual provider: delegate to content to prompt user
+  try {
+    const res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { type: "PromptForCode", message: step.promptMessage || "Enter the code you received" } });
+    if (res?.ok && res.value) {
+      await saveVariable(step.variable || "otp", res.value);
+      return { ok: true, value: res.value };
+    }
+    return { ok: false, error: res?.error || "prompt_cancelled" };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+async function mailslurpFetchLatest(apiKey, inboxId) {
+  const base = "https://api.mailslurp.com";
+  // get latest email for inbox
+  const listUrl = `${base}/inboxes/${encodeURIComponent(inboxId)}/emails?size=1&sort=DESC`;
+  const list = await fetchJson(listUrl, apiKey);
+  const item = Array.isArray(list?.content) && list.content[0];
+  if (!item?.id) return null;
+  const email = await fetchJson(`${base}/emails/${encodeURIComponent(item.id)}`, apiKey);
+  return { subject: email?.subject || "", body: email?.body || email?.text || "" };
+}
+
+async function fetchJson(url, apiKey) {
+  const res = await fetch(url, { headers: { "Content-Type": "application/json", "x-api-key": apiKey } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function saveVariable(name, value) {
+  const key = "variables";
+  const data = await chrome.storage.local.get([key]);
+  const next = { ...(data?.[key] || {}), [name]: value };
+  await chrome.storage.local.set({ [key]: next });
 }
 
 function broadcastToOptions(payload) {

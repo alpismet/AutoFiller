@@ -9,7 +9,8 @@ const DEFAULT_FLOW = [
 const DEFAULT_SETTINGS = Object.freeze({
   stepDelayMs: 300,
   selectorWaitMs: 5000,
-  useNativeClick: false
+  useNativeClick: false,
+  mailslurpApiKey: ""
 });
 
 const RUN_STATUS_META = {
@@ -68,6 +69,23 @@ const STEP_LIBRARY = [
     description: "Play the completion chime (requires audio permission).",
     fields: []
   }
+  ,
+  {
+    type: "WaitForEmailCode",
+    label: "Wait for Email Code",
+    description: "Fetch a verification code from email (MailSlurp or manual prompt).",
+    fields: [
+      { key: "provider", label: "Provider", type: "select", required: true, options: [
+        { value: "manual", label: "Manual Prompt" },
+        { value: "mailslurp", label: "MailSlurp" }
+      ], default: "manual" },
+      { key: "inboxId", label: "MailSlurp Inbox ID", type: "text", placeholder: "00000000-0000-0000-0000-000000000000" },
+      { key: "regex", label: "Extraction Regex (group 1)", type: "text", placeholder: "\\b(\\d{4,8})\\b", default: "\\b(\\d{4,8})\\b" },
+      { key: "variable", label: "Save as variable", type: "text", required: true, placeholder: "otp", default: "otp" },
+      { key: "timeoutMs", label: "Timeout (ms)", type: "number", placeholder: "120000", min: 1000, step: 500, default: 120000 },
+      { key: "promptMessage", label: "Manual prompt message", type: "text", placeholder: "Enter the code you received" }
+    ]
+  }
 ];
 
 const STEP_LIBRARY_MAP = new Map(STEP_LIBRARY.map((step) => [step.type, step]));
@@ -93,7 +111,8 @@ const els = {
   // settings controls
   stepDelayMs: document.getElementById("stepDelayMs"),
   selectorWaitMs: document.getElementById("selectorWaitMs"),
-  useNativeClick: document.getElementById("useNativeClick")
+  useNativeClick: document.getElementById("useNativeClick"),
+  mailslurpApiKey: document.getElementById("mailslurpApiKey")
 };
 
 const state = {
@@ -234,6 +253,11 @@ function wireEvents() {
     setDirty(true, { silent: true });
   });
 
+  els.mailslurpApiKey?.addEventListener("input", (e) => {
+    state.settings.mailslurpApiKey = e.target.value.trim();
+    setDirty(true, { silent: true });
+  });
+
 }
 
 async function loadFromStorage() {
@@ -265,6 +289,7 @@ function render() {
   if (els.stepDelayMs) els.stepDelayMs.value = String(state.settings.stepDelayMs ?? DEFAULT_SETTINGS.stepDelayMs);
   if (els.selectorWaitMs) els.selectorWaitMs.value = String(state.settings.selectorWaitMs ?? DEFAULT_SETTINGS.selectorWaitMs);
   if (els.useNativeClick) els.useNativeClick.checked = Boolean(state.settings.useNativeClick ?? DEFAULT_SETTINGS.useNativeClick);
+  if (els.mailslurpApiKey) els.mailslurpApiKey.value = String(state.settings.mailslurpApiKey ?? "");
   updateEmptyState();
   setControlsDisabled(Boolean(state.pendingPicker));
   if (state.pendingPicker) {
@@ -411,6 +436,14 @@ function buildFields(container, schema, step, stepIndex) {
     let input;
     if (field.type === "textarea") {
       input = document.createElement("textarea");
+    } else if (field.type === "select") {
+      input = document.createElement("select");
+      (field.options || []).forEach((opt) => {
+        const option = document.createElement("option");
+        option.value = String(opt.value);
+        option.textContent = String(opt.label ?? opt.value);
+        input.appendChild(option);
+      });
     } else if (field.type === "checkbox") {
       input = document.createElement("input");
       input.type = "checkbox";
@@ -433,6 +466,12 @@ function buildFields(container, schema, step, stepIndex) {
       } else if (field.default !== undefined) {
         input.checked = Boolean(field.default);
       }
+    } else if (field.type === "select") {
+      if (existing !== undefined && existing !== null) {
+        input.value = String(existing);
+      } else if (field.default !== undefined) {
+        input.value = String(field.default);
+      }
     } else {
       if (existing !== undefined && existing !== null) {
         input.value = String(existing);
@@ -444,6 +483,12 @@ function buildFields(container, schema, step, stepIndex) {
     if (field.type === "checkbox") {
       input.addEventListener("change", (event) => {
         const rawValue = Boolean(event.target.checked);
+        setDirty(true, { silent: true });
+        updateFieldValue(stepIndex, field, rawValue);
+      });
+    } else if (field.type === "select") {
+      input.addEventListener("change", (event) => {
+        const rawValue = event.target.value;
         setDirty(true, { silent: true });
         updateFieldValue(stepIndex, field, rawValue);
       });

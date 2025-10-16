@@ -364,6 +364,11 @@ async function handleRunStep(step) {
     if (!step || typeof step.type !== "string") return { ok: false, error: "invalid_step" };
     try {
         switch (step.type) {
+            case "PromptForCode": {
+                const val = window.prompt(step.message || "Enter code");
+                if (val && val.trim()) return { ok: true, value: val.trim() };
+                return { ok: false, error: "cancelled" };
+            }
             case "Click": {
                 const timeout = Number(step.selectorWaitMs) || 5000;
                 const base = await waitForSelectorSafe(step.selector, timeout);
@@ -389,7 +394,8 @@ async function handleRunStep(step) {
                 const el = await waitForSelectorSafe(step.selector, timeout);
                 if (!el) return { ok: false, error: "selector_not_found" };
                 el.focus();
-                el.value = step.value;
+                const value = await resolveVariablesInText(step.value);
+                el.value = value;
                 el.dispatchEvent(new Event("input", { bubbles: true }));
                 el.dispatchEvent(new Event("change", { bubbles: true }));
                 return { ok: true };
@@ -472,6 +478,22 @@ async function handleRunStep(step) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function resolveVariablesInText(text) {
+    if (!text || typeof text !== "string") return text;
+    const m = text.match(/\{\{([^}]+)\}\}/g);
+    if (!m) return text;
+    let vars = {};
+    try { const res = await chrome.storage.local.get(["variables"]); vars = res?.variables || {}; } catch {}
+    let out = text;
+    m.forEach((tpl) => {
+        const key = tpl.slice(2, -2).trim();
+        if (key && Object.prototype.hasOwnProperty.call(vars, key)) {
+            out = out.replaceAll(tpl, String(vars[key]));
+        }
+    });
+    return out;
+}
 
 async function waitForSelectorSafe(selector, timeoutMs) {
     if (!selector || typeof selector !== "string") return null;
