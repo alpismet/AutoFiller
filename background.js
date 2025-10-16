@@ -35,6 +35,9 @@ const STEP_SANITIZERS = {
     const value = step.value != null ? String(step.value) : "";
     const out = { type: "FillText", selector, value };
     if (step.splitAcrossInputs !== undefined) out.splitAcrossInputs = Boolean(step.splitAcrossInputs);
+    if (step.slowType !== undefined) out.slowType = Boolean(step.slowType);
+    const d = Number(step.slowTypeDelayMs);
+    if (Number.isFinite(d) && d >= 0) out.slowTypeDelayMs = d;
     return out;
   },
   EnsureAudio(step) {
@@ -417,7 +420,9 @@ async function waitForEmailGmail(step) {
   const until = Date.now() + timeoutMs;
   const re = /(\d{6})/; // default 6-digit OTP
   const startedAt = Date.now();
+  let attempts = 0;
   while (Date.now() < until) {
+    attempts++;
     const msg = await gmailFetchLatestByQuery(token, { subject: step.subject || "", newerThanMs: startedAt });
     if (msg) {
       const combined = [msg.snippet || "", msg.body || ""].join("\n");
@@ -459,7 +464,7 @@ async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } 
     return parts.join(" ");
   };
 
-  const SKEW_MS = 120000; // allow 2 minutes clock skew around start time
+  const SKEW_MS = 60000; // allow up to 60s negative skew for provider clock differences
   const fetchAndFilter = async (includeInbox) => {
     const q = buildQuery(includeInbox);
     const listUrl = `${base}/messages?q=${encodeURIComponent(q)}&maxResults=5`;
@@ -473,12 +478,16 @@ async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } 
       const headers = Array.isArray(msg?.payload?.headers) ? msg.payload.headers : [];
       const subj = headers.find(h => (h.name || "").toLowerCase() === "subject")?.value || "";
       const subjectOk = !subject || subj.toLowerCase().includes(subject.toLowerCase());
-      const timeOk = !newerThanMs || internalDate >= (newerThanMs - SKEW_MS);
-      return { id: m.id, snippet: msg?.snippet || "", text, internalDate, subjectOk, timeOk };
+      const timeOkStrict = !newerThanMs || internalDate >= newerThanMs;
+      const timeOkSkew = !newerThanMs || internalDate >= (newerThanMs - SKEW_MS);
+      return { id: m.id, snippet: msg?.snippet || "", text, internalDate, subjectOk, timeOkStrict, timeOkSkew };
     }));
-    const filtered = details.filter(d => d.subjectOk && d.timeOk && (d.text || d.snippet));
-    filtered.sort((a, b) => b.internalDate - a.internalDate);
-    return filtered;
+    const strict = details.filter(d => d.subjectOk && d.timeOkStrict && (d.text || d.snippet));
+    strict.sort((a, b) => b.internalDate - a.internalDate);
+    if (strict.length) return strict;
+    const skew = details.filter(d => d.subjectOk && d.timeOkSkew && (d.text || d.snippet));
+    skew.sort((a, b) => b.internalDate - a.internalDate);
+    return skew;
   };
 
   // Try with inbox scope first
@@ -489,7 +498,7 @@ async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } 
   }
   if (!filtered.length) return null;
   const top = filtered[0];
-  return { snippet: top?.snippet || "", body: top?.text || "" };
+  return { id: top.id, snippet: top?.snippet || "", body: top?.text || "" };
 }
 
 function extractMessageText(msg) {
