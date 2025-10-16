@@ -280,6 +280,16 @@
     }
     .settings .setting-row { display: grid; gap: 6px; }
     .settings .setting-row input { max-width: 220px; }
+    /* Gmail status should truncate long emails */
+    #gmailStatus {
+      display: block;
+      max-width: 100%;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+      color: var(--text-light);
+      margin-top: 4px;
+    }
   </style>
 </head>
 <body>
@@ -340,8 +350,21 @@
             </label>
           </div>
           <div class="setting-row">
-            <label for="mailslurpApiKey">MailSlurp API Key</label>
-            <input id="mailslurpApiKey" type="text" placeholder="sk_..." />
+          </div>
+          <hr />
+          <div class="setting-row">
+            <label for="gmailClientId">Gmail OAuth Client ID</label>
+            <input id="gmailClientId" type="text" placeholder="xxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-apps-googleusercontent-com" />
+          </div>
+          <div class="setting-row" style="display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
+            <button id="connectGmailBtn" type="button">Connect Gmail</button>
+            <button id="testWaitForEmailGmailBtn" type="button">Test WaitForEmailGmail</button>
+          </div>
+          <div class="setting-row">
+            <span id="gmailStatus" title="Not connected">Not connected</span>
+          </div>
+          <div class="setting-row" id="gmailSecurityNote" style="font-size:12px; color: var(--text-light);">
+            Note: Never commit secrets to source control. Use your own Google OAuth Client ID; no client secret is stored in this extension.
           </div>
         </div>
       </div>
