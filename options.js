@@ -44,7 +44,9 @@ const STEP_LIBRARY = [
     fields: [
       { key: "selector", label: "CSS Selector", type: "text", required: true, placeholder: "input[name='email']", supportsPicker: true },
       { key: "value", label: "Value", type: "textarea", required: true, placeholder: "hello@example.com" },
-      { key: "splitAcrossInputs", label: "Split value across multiple inputs", type: "checkbox", default: false }
+      { key: "splitAcrossInputs", label: "Split value across multiple inputs", type: "checkbox", default: false },
+      { key: "slowType", label: "Slow typing", type: "checkbox", default: false },
+      { key: "slowTypeDelayMs", label: "Slow typing delay (ms)", type: "number", min: 0, step: 10, default: 100 }
     ]
   },
   {
@@ -483,9 +485,90 @@ function buildFields(container, schema, step, stepIndex) {
 
   schema.fields.forEach((field) => {
     // Hide the dedicated checkbox field for FillText split since we expose an inline toggle next to selector
-    if (schema.type === "FillText" && field.key === "splitAcrossInputs") {
-      // Ensure the value remains in the step object via defaults/sanitization, but don't render a separate UI control
+      // Removed old Split toggle next to selector for FillText; Input section renders this now
+      if (schema.type === "FillText" && field.key === "splitAcrossInputs") return;
+      // Always hide slowTypeDelayMs; custom Input section renders its control
+      if (schema.type === "FillText" && field.key === "slowTypeDelayMs") return;
+    // Hide slowType base field; we'll render a custom combined UI block instead
+    if (schema.type === "FillText" && field.key === "slowType") {
       return;
+    }
+
+    // For FillText, inject a custom "Input" section just before the Value field
+    if (schema.type === "FillText" && field.key === "value") {
+      const inputSection = document.createElement("div");
+      inputSection.className = "field";
+      const secLabel = document.createElement("label");
+      secLabel.textContent = "Input";
+  const row = document.createElement("div");
+  row.className = "input-row";
+  row.style.justifyContent = "flex-start";
+  row.style.gap = "8px";
+
+      // Split toggle (OTP)
+      const splitBtn = document.createElement("button");
+      splitBtn.type = "button";
+  splitBtn.className = "toggle";
+  splitBtn.style.marginRight = "4px";
+      splitBtn.title = "Split across multiple inputs (OTP)";
+      splitBtn.setAttribute("aria-label", "Split across multiple inputs");
+      splitBtn.textContent = "🔢";
+      const applySplitState = () => {
+        const active = Boolean(state.steps[stepIndex]?.splitAcrossInputs);
+        splitBtn.classList.toggle("active", active);
+        splitBtn.setAttribute("aria-pressed", String(active));
+      };
+      applySplitState();
+      splitBtn.addEventListener("click", () => {
+        const cur = Boolean(state.steps[stepIndex]?.splitAcrossInputs);
+        state.steps[stepIndex].splitAcrossInputs = !cur;
+        applySplitState();
+        setDirty(true, { silent: true });
+      });
+      row.appendChild(splitBtn);
+
+      // Slow typing toggle
+      const slowBtn = document.createElement("button");
+      slowBtn.type = "button";
+  slowBtn.className = "toggle";
+  slowBtn.style.marginLeft = "4px";
+      slowBtn.title = "Slow typing";
+      slowBtn.setAttribute("aria-label", "Slow typing");
+      slowBtn.textContent = "🐢";
+      const delayInput = document.createElement("input");
+      delayInput.type = "number";
+      delayInput.min = "0";
+      delayInput.step = "10";
+      delayInput.placeholder = "100";
+      delayInput.style.marginLeft = "8px";
+      const applySlowState = () => {
+        const active = Boolean(state.steps[stepIndex]?.slowType);
+        slowBtn.classList.toggle("active", active);
+        slowBtn.setAttribute("aria-pressed", String(active));
+        delayInput.style.display = active ? "" : "none";
+        const cur = state.steps[stepIndex]?.slowTypeDelayMs;
+        delayInput.value = String(Number.isFinite(cur) ? cur : 100);
+      };
+      applySlowState();
+      slowBtn.addEventListener("click", () => {
+        const cur = Boolean(state.steps[stepIndex]?.slowType);
+        state.steps[stepIndex].slowType = !cur;
+        applySlowState();
+        setDirty(true, { silent: true });
+      });
+      delayInput.addEventListener("input", (e) => {
+        const v = Number(e.target.value);
+        if (Number.isFinite(v) && v >= 0) {
+          state.steps[stepIndex].slowTypeDelayMs = v;
+          setDirty(true, { silent: true });
+        }
+      });
+      row.appendChild(slowBtn);
+      row.appendChild(delayInput);
+
+      inputSection.appendChild(secLabel);
+      inputSection.appendChild(row);
+      container.appendChild(inputSection);
     }
     const fieldWrapper = document.createElement("div");
     fieldWrapper.className = "field";
@@ -604,28 +687,7 @@ function buildFields(container, schema, step, stepIndex) {
       }
 
       // Add Split toggle next to selector for FillText steps (one char per input)
-      const isFillTextSelector = stepObj?.type === "FillText" && field.key === "selector";
-      if (isFillTextSelector) {
-        const splitBtn = document.createElement("button");
-        splitBtn.type = "button";
-        splitBtn.className = "toggle";
-        splitBtn.title = "Split across multiple inputs";
-        splitBtn.setAttribute("aria-label", "Split value across multiple inputs");
-        splitBtn.textContent = "🔢";
-        const applySplitState = () => {
-          const active = Boolean(state.steps[stepIndex]?.splitAcrossInputs);
-          splitBtn.classList.toggle("active", active);
-          splitBtn.setAttribute("aria-pressed", String(active));
-        };
-        applySplitState();
-        splitBtn.addEventListener("click", () => {
-          const cur = Boolean(state.steps[stepIndex]?.splitAcrossInputs);
-          state.steps[stepIndex].splitAcrossInputs = !cur;
-          applySplitState();
-          setDirty(true, { silent: true });
-        });
-        row.appendChild(splitBtn);
-      }
+        // Removed old Split toggle next to selector for FillText; Input section renders this now
       inputHost = row;
       if (isActive) {
         fieldWrapper.classList.add("picking");

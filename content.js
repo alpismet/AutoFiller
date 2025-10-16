@@ -393,55 +393,149 @@ async function handleRunStep(step) {
                 const timeout = Number(step.selectorWaitMs) || 5000;
                 const value = await resolveVariablesInText(step.value);
                 if (step.splitAcrossInputs) {
-                    const nodes = await waitForAllSelectors(step.selector, timeout);
-                    if (!nodes.length) return { ok: false, error: "selector_not_found" };
-                        // Prefer real input-like elements
-                        let inputs = Array.from(nodes).filter(n => n && n.nodeType === Node.ELEMENT_NODE && (n.matches?.('input,textarea,[contenteditable="true"]') || 'value' in n));
-                        // If selector points to container(s) (e.g., div.grid.grid-cols-6), search for input-like descendants
-                        if (!inputs.length) {
+                    const start = Date.now();
+                    const delay = step.slowType ? Math.max(0, Number(step.slowTypeDelayMs) || 100) : 0;
+                    const onlyDigits = String(value).match(/\d/g);
+                    const chars = onlyDigits && onlyDigits.length ? onlyDigits : Array.from(String(value));
+
+                    const collectInputs = () => {
+                        const base = (() => {
+                            try { return document.querySelectorAll(step.selector); } catch { return []; }
+                        })();
+                        let list = Array.from(base).filter(n => n && n.nodeType === Node.ELEMENT_NODE && (n.matches?.('input,textarea,[contenteditable="true"]') || 'value' in n));
+                        if (!list.length) {
                             const descendant = [];
-                            Array.from(nodes).forEach((container) => {
+                            Array.from(base).forEach((container) => {
                                 try {
                                     const found = container.querySelectorAll('input,textarea,[contenteditable="true"]');
                                     descendant.push(...Array.from(found));
                                 } catch {}
                             });
-                            inputs = descendant.filter(n => n && n.nodeType === Node.ELEMENT_NODE);
+                            list = descendant.filter(n => n && n.nodeType === Node.ELEMENT_NODE);
                         }
-                        // Optionally prioritize one-char OTP fields
-                        if (inputs.length) {
-                            inputs.sort((a, b) => {
+                        if (list.length) {
+                            list.sort((a, b) => {
                                 const aMax = Number(a.getAttribute?.('maxlength')) || 0;
                                 const bMax = Number(b.getAttribute?.('maxlength')) || 0;
                                 const aScore = aMax === 1 ? 0 : 1;
                                 const bScore = bMax === 1 ? 0 : 1;
-                                return aScore - bScore; // maxlength=1 first
+                                return aScore - bScore;
                             });
                         }
-                        if (!inputs.length) return { ok: false, error: "selector_not_found" };
-                    // Distribute characters across inputs
-                    let i = 0;
-                    // Use only digits when available (OTP style). If no digits, fall back to all characters.
-                    const onlyDigits = String(value).match(/\d/g);
-                    const chars = onlyDigits && onlyDigits.length ? onlyDigits : Array.from(String(value));
-                    for (let idx = 0; idx < inputs.length; idx++) {
-                        const node = inputs[idx];
-                        const ch = chars[i] ?? "";
-                        focusAndSetValue(node, ch);
-                        // attempt to auto-advance focus for OTP UX
-                        if (ch && idx + 1 < inputs.length) {
-                            try { inputs[idx + 1].focus(); } catch {}
+                        return list;
+                    };
+
+                    let inputs = collectInputs();
+                    if (!inputs.length) {
+                        // Wait until at least one input appears
+                        while (!inputs.length && (Date.now() - start) <= timeout) {
+                            await sleep(100);
+                            inputs = collectInputs();
                         }
+                        if (!inputs.length) return { ok: false, error: "selector_not_found" };
+                    }
+
+                    let i = 0;
+                    while (i < chars.length) {
+                        // Ensure there are enough inputs; if not, wait/poll for more (e.g., lazy render)
+                        while (inputs.length <= i && (Date.now() - start) <= timeout) {
+                            await sleep(100);
+                            inputs = collectInputs();
+                        }
+                        if (inputs.length <= i) return { ok: false, error: "insufficient_inputs" };
+                        const node = inputs[i];
+                        const ch = chars[i] ?? "";
+                                    if (step.slowType && ch) {
+                            try { node.focus(); } catch {}
+                            simulateKey(node, 'keydown', ch);
+                            simulateKey(node, 'keypress', ch);
+                                        dispatchBeforeInput(node, 'insertText', ch);
+                            setNativeValue(node, (node.value ?? "") + ch);
+                            try { node.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+                            simulateKey(node, 'keyup', ch);
+                        } else {
+                            focusAndSetValue(node, ch);
+                        }
+                        // auto-advance focus to next slot if available
+                        if (ch && inputs[i + 1]) { try { inputs[i + 1].focus(); } catch {} }
                         i += 1;
-                        if (i >= chars.length) break;
+                        if (delay) await sleep(delay);
                     }
                     return { ok: true };
-                } else {
-                    const el = await waitForSelectorSafe(step.selector, timeout);
-                    if (!el) return { ok: false, error: "selector_not_found" };
-                    focusAndSetValue(el, value);
-                    return { ok: true };
-                }
+                            } else {
+                                // Resolve actual editable target: selector may point to a wrapper (e.g., date-picker)
+                                const base = await waitForSelectorSafe(step.selector, timeout);
+                                if (!base) return { ok: false, error: "selector_not_found" };
+                                const isEditable = (n) => !!(n && (n.matches?.('input,textarea,[contenteditable="true"]') || 'value' in n));
+                                let el = isEditable(base) ? base : null;
+
+                                const findDescendant = (root) => {
+                                    try { return root.querySelector('input,textarea,[contenteditable="true"]'); } catch { return null; }
+                                };
+                                
+                                if (!el) {
+                                    // Try descendant input
+                                    el = findDescendant(base);
+                                }
+                                if (!el) {
+                                    // Try label[for] -> document.getElementById(for)
+                                    let lbl = null;
+                                    try { lbl = base.querySelector('label[for]'); } catch {}
+                                    if (!lbl && base.previousElementSibling && base.previousElementSibling.matches?.('label[for]')) {
+                                        lbl = base.previousElementSibling;
+                                    }
+                                    const forId = lbl?.getAttribute?.('for');
+                                    if (forId) {
+                                        const byId = document.getElementById(forId);
+                                        if (isEditable(byId)) el = byId;
+                                    }
+                                }
+                                if (!el) {
+                                    // Click wrapper to reveal input, then poll for descendant
+                                    try { base.click?.(); } catch {}
+                                    const startReveal = Date.now();
+                                    while (!el && (Date.now() - startReveal) <= 2000) {
+                                        await sleep(100);
+                                        el = findDescendant(base);
+                                    }
+                                }
+                                if (!el) return { ok: false, error: "selector_not_editable" };
+
+                                if (step.slowType) {
+                                    // Key-by-key typing without pre-clearing (to avoid breaking masks)
+                                    try { el.focus?.(); } catch {}
+                                    // Select all to replace existing content cleanly (if supported)
+                                    try {
+                                        if (typeof el.select === 'function') el.select();
+                                        else if (Number.isFinite(el.selectionStart) && Number.isFinite(el.selectionEnd)) {
+                                            el.selectionStart = 0; el.selectionEnd = String(el.value ?? '').length;
+                                        }
+                                    } catch {}
+                                    const chars = Array.from(String(value));
+                                    const delay = Math.max(0, Number(step.slowTypeDelayMs) || 100);
+                                    for (const ch of chars) {
+                                        try { el.focus?.(); } catch {}
+                                        simulateKey(el, 'keydown', ch);
+                                        simulateKey(el, 'keypress', ch);
+                                        dispatchBeforeInput(el, 'insertText', ch);
+                                        const cur = String(el.value ?? "");
+                                        const start = Number.isFinite(el.selectionStart) ? el.selectionStart : cur.length;
+                                        const end = Number.isFinite(el.selectionEnd) ? el.selectionEnd : cur.length;
+                                        const next = cur.slice(0, start) + ch + cur.slice(end);
+                                        setNativeValue(el, next);
+                                        // advance caret
+                                        try { el.setSelectionRange?.(start + 1, start + 1); } catch {}
+                                        try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+                                        simulateKey(el, 'keyup', ch);
+                                        if (delay) await sleep(delay);
+                                    }
+                                    // Fire change at the end for frameworks listening to it
+                                    try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+                                } else {
+                                    focusAndSetValue(el, value);
+                                }
+                                return { ok: true };
+                            }
             }
 
                         case "SelectDropdown": {
@@ -626,19 +720,9 @@ function focusAndSetValue(el, value) {
     try { el.focus(); } catch {}
     const tag = el.tagName?.toLowerCase();
     const type = (el.getAttribute && el.getAttribute('type') || '').toLowerCase();
-    const setNativeValue = (element, v) => {
-        try {
-            const proto = element.tagName?.toLowerCase() === 'textarea' ? TextAreaElementPrototype() : HTMLInputElement.prototype;
-            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-            if (desc && typeof desc.set === 'function') {
-                desc.set.call(element, v);
-                return true;
-            }
-        } catch {}
-        try { element.value = v; return true; } catch {}
-        return false;
-    };
     if (tag === 'input' || tag === 'textarea') {
+        // Notify frameworks that text will change
+        dispatchBeforeInput(el, 'insertReplacementText', String(value ?? ''));
         setNativeValue(el, value);
     } else if ('value' in el) {
         // Fallback for custom elements
@@ -662,6 +746,33 @@ function focusAndSetValue(el, value) {
 // Helper to safely access TextAreaElement prototype across browsers
 function TextAreaElementPrototype() {
     try { return HTMLTextAreaElement?.prototype || HTMLElement.prototype; } catch { return HTMLElement.prototype; }
+}
+
+function setNativeValue(element, v) {
+    try {
+        const proto = element.tagName?.toLowerCase() === 'textarea' ? TextAreaElementPrototype() : HTMLInputElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (desc && typeof desc.set === 'function') {
+            desc.set.call(element, v);
+            return true;
+        }
+    } catch {}
+    try { element.value = v; return true; } catch {}
+    return false;
+}
+
+function simulateKey(el, type, ch) {
+    const key = ch;
+    const upper = String(ch || '').toUpperCase();
+    const code = /\d/.test(ch) ? `Digit${ch}` : (/^[A-Z]$/.test(upper) ? `Key${upper}` : (ch === ' ' ? 'Space' : undefined));
+    try { el.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, key, code })); } catch {}
+}
+
+function dispatchBeforeInput(el, inputType, data) {
+    try {
+        const evt = new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: inputType || 'insertText', data: data ?? '' });
+        el.dispatchEvent(evt);
+    } catch {}
 }
 
 function findClickable(node) {
