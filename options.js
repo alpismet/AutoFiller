@@ -71,6 +71,18 @@ const STEP_LIBRARY = [
   }
   ,
   {
+    type: "SelectDropdown",
+    label: "Select from dropdown",
+    description: "Open a dropdown and select an option by text.",
+    fields: [
+      { key: "controlSelector", label: "Control selector", type: "text", required: true, placeholder: ".agora-input-select-control", supportsPicker: true },
+      { key: "optionText", label: "Option text contains", type: "text", required: true, placeholder: "Turquia" },
+      { key: "optionItemSelector", label: "Option items selector (optional)", type: "text", required: false, placeholder: "li,[role='option'],.dropdown-item,.agora-dropdown-option" },
+      { key: "timeoutMs", label: "Timeout (ms)", type: "number", placeholder: "10000", min: 500, step: 500, default: 10000 }
+    ]
+  }
+  ,
+  {
     type: "WaitForEmailGmail",
     label: "Wait for Email (Gmail)",
     description: "Poll Gmail with a search query and extract a 6-digit code.",

@@ -444,6 +444,60 @@ async function handleRunStep(step) {
                 }
             }
 
+                        case "SelectDropdown": {
+                                const timeout = Number(step.timeoutMs) || 10000;
+                                const control = await waitForSelectorSafe(step.controlSelector, timeout);
+                                if (!control) return { ok: false, error: "control_not_found" };
+                                // Open the dropdown (click or Enter)
+                                try { control.focus(); } catch {}
+                                try { control.click(); } catch {}
+                                try { control.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch {}
+                                try { control.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter' })); } catch {}
+
+                                const itemSel = (typeof step.optionItemSelector === 'string' && step.optionItemSelector.trim())
+                                    ? step.optionItemSelector.trim()
+                                    : "li,[role='option'],.dropdown-item,.agora-dropdown-option";
+
+                                // Wait for list items to appear near the control: first query globally, if not, search in siblings/ancestors
+                                let items = [];
+                                const start = Date.now();
+                                while (Date.now() - start <= timeout) {
+                                    try {
+                                        items = Array.from(document.querySelectorAll(itemSel));
+                                        if (items.length) break;
+                                        // Try looking within likely container elements (dropdowns near control)
+                                        const root = control.closest('[aria-controls]') || control.parentElement || document.body;
+                                        items = Array.from((root || document).querySelectorAll(itemSel));
+                                        if (items.length) break;
+                                    } catch {}
+                                    await sleep(100);
+                                }
+                                if (!items.length) return { ok: false, error: "options_not_found" };
+
+                                // Match by text content contains (case-insensitive)
+                                const want = String(step.optionText || '').trim().toLowerCase();
+                                const getText = (el) => (el?.textContent || '').trim().toLowerCase();
+                                let target = items.find(el => getText(el).includes(want));
+                                // Some UIs wrap the label in inner span.option-content; try a deeper scan if needed
+                                if (!target) {
+                                    for (const el of items) {
+                                        const inner = el.querySelector('.option-content, span, div');
+                                        if (inner && getText(inner).includes(want)) { target = el; break; }
+                                    }
+                                }
+                                if (!target) return { ok: false, error: "option_not_found" };
+
+                                // Scroll into view and select
+                                try { target.scrollIntoView({ block: 'nearest' }); } catch {}
+                                try { target.focus(); } catch {}
+                                try { target.click(); } catch {}
+                                try { target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch {}
+                                // Also try Enter in case the option is keyboard activated
+                                try { target.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter' })); } catch {}
+
+                                return { ok: true };
+                        }
+
             case "Wait":
                 await sleep(step.ms || 1000);
                 return { ok: true };
