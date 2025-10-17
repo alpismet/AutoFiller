@@ -49,6 +49,31 @@ const STEP_SANITIZERS = {
   PlaySound() {
     return { type: "PlaySound" };
   },
+  Restart(step) {
+    const m = Number(step.max);
+    let max = 1;
+    if (Number.isFinite(m)) {
+      if (m === -1) max = -1; // infinite
+      else if (m > 0) max = Math.floor(m);
+    }
+    return { type: 'Restart', max };
+  },
+  SelectFiles(step) {
+    const selector = typeof step.selector === "string" ? step.selector.trim() : "";
+    if (!selector) return null;
+    const out = { type: "SelectFiles", selector };
+    const list = Array.isArray(step.files) ? step.files : [];
+    out.files = list
+      .map((f) => ({
+        name: typeof f?.name === "string" ? f.name : "file",
+        type: typeof f?.type === "string" ? f.type : "application/octet-stream",
+        size: Number(f?.size) || 0,
+        dataUrl: typeof f?.dataUrl === "string" && f.dataUrl.startsWith("data:") ? f.dataUrl : ""
+      }))
+      .filter(f => f.dataUrl);
+    if (!out.files.length) return null;
+    return out;
+  },
   SelectDropdown(step) {
     const controlSelector = typeof step.controlSelector === "string" ? step.controlSelector.trim() : "";
     const optionText = typeof step.optionText === "string" ? step.optionText.trim() : "";
@@ -58,6 +83,15 @@ const STEP_SANITIZERS = {
     const t = Number(step.timeoutMs);
     if (Number.isFinite(t) && t > 0) out.timeoutMs = t; else out.timeoutMs = 10000;
     return out;
+  },
+  If(step) {
+    const mode = (typeof step.mode === 'string' && step.mode.toLowerCase() === 'visible') ? 'visible' : 'exists';
+    const selector = typeof step.selector === 'string' ? step.selector.trim() : '';
+    if (!selector) return null;
+    const t = Number(step.timeoutMs); const timeoutMs = Number.isFinite(t) && t >= 0 ? t : 0;
+    const thenArr = sanitizeFlowArray(Array.isArray(step.then) ? step.then : []);
+    const elseArr = sanitizeFlowArray(Array.isArray(step.else) ? step.else : []);
+    return { type: 'If', mode, selector, timeoutMs, then: thenArr, else: elseArr };
   },
   
   WaitForEmailGmail(step) {
@@ -128,6 +162,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const cur = await getTabUrl(targetTabId);
           if (isForbiddenUrl(cur)) throw new Error("Target page is not scriptable: " + cur);
           await ensureContentScript(targetTabId);
+        } else if (step.type === 'Wait') {
+          const total = Math.max(0, Number(step.ms) || 1000);
+          const until = Date.now() + total;
+          let last = -1;
+          if (index >= 0) { try { broadcastToOptions({ type: 'FLOW_STATUS', index, status: 'running' }); } catch {} }
+          while (Date.now() < until) {
+            const remain = Math.ceil((until - Date.now()) / 1000);
+            if (remain !== last) {
+              last = remain;
+              if (index >= 0) {
+                try { broadcastToOptions({ type: 'WAIT_COUNTDOWN', index, seconds: Math.max(0, remain) }); } catch {}
+              }
+            }
+            await wait(250);
+          }
+        } else if (step.type === 'Restart') {
+          // Running a single Restart step does not make sense; no-op
+          // Respond ok to avoid errors in UI
+          sendResponse({ ok: true });
+          return;
+        } else if (step.type === 'If') {
+          await ensureContentScript(targetTabId);
+          const res = await chrome.tabs.sendMessage(targetTabId, { type: 'RUN_STEP', step: { type: 'CheckElement', selector: step.selector, mode: step.mode || 'exists', timeoutMs: step.timeoutMs || 0 } });
+          const cond = Boolean(res && (res.value === true || res.ok === true && res.value !== false));
+          try { if (index >= 0) broadcastToOptions({ type: 'IF_RESULT', index, result: cond ? 'then' : 'else' }); } catch {}
+          const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
+          if (Array.isArray(branch) && branch.length) {
+            await runStepsInline(branch, targetTabId, { parentIndex: index, branchKey: cond ? 'then' : 'else' });
+          }
         } else if (step.type === "WaitForEmailGmail") {
           const res = await waitForEmailGmail(step);
           if (!res?.ok) throw new Error(res?.error || "step_failed");
@@ -354,6 +417,40 @@ async function runFlow(flow, tabId) {
         const url = await getTabUrl(tabId);
         if (isForbiddenUrl(url)) throw new Error("Target page is not scriptable: " + url);
         await ensureContentScript(tabId);
+      } else if (step.type === 'Wait') {
+        const total = Math.max(0, Number(step.ms) || 1000);
+        const until = Date.now() + total;
+        let last = -1;
+        while (Date.now() < until) {
+          const remain = Math.ceil((until - Date.now()) / 1000);
+          if (remain !== last) {
+            last = remain;
+            try { broadcastToOptions({ type: 'WAIT_COUNTDOWN', index: i, seconds: Math.max(0, remain) }); } catch {}
+          }
+          await wait(250);
+        }
+      } else if (step.type === 'Restart') {
+        // initialize remaining budget if needed
+        if (typeof step._remaining !== 'number') step._remaining = (step.max === -1) ? Infinity : (Number(step.max) || 1);
+        if (step._remaining === Infinity || step._remaining > 0) {
+          if (step._remaining !== Infinity) step._remaining -= 1;
+          // reset statuses and restart from the beginning
+          broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+          i = -1; // next loop starts at 0
+        }
+      } else if (step.type === 'If') {
+        await ensureContentScript(tabId);
+        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: { type: 'CheckElement', selector: step.selector, mode: step.mode || 'exists', timeoutMs: step.timeoutMs || 0 } });
+        const cond = Boolean(res && (res.value === true || (res.ok === true && res.value !== false)));
+        try { broadcastToOptions({ type: 'IF_RESULT', index: i, result: cond ? 'then' : 'else' }); } catch {}
+        const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
+        if (Array.isArray(branch) && branch.length) {
+          const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else' });
+          if (outcome && outcome.restartRequested) {
+            broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+            i = -1; // restart
+          }
+        }
       } else {
         await ensureContentScript(tabId);
         let res = null;
@@ -373,6 +470,84 @@ async function runFlow(flow, tabId) {
     }
     const delay = Math.max(0, Number(settings.stepDelayMs) || 0);
     if (delay) await wait(delay);
+  }
+}
+
+async function runStepsInline(steps, tabId, ctx) {
+  if (!Array.isArray(steps) || !steps.length) return;
+  // read settings
+  let settings = { stepDelayMs: 300, selectorWaitMs: 5000, useNativeClick: false };
+  try {
+    const s = await chrome.storage.local.get(["settings"]);
+    settings = { ...settings, ...(s?.settings || {}) };
+  } catch {}
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    try {
+      if (ctx && typeof ctx.parentIndex === 'number') {
+        try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, status: 'running' }); } catch {}
+      }
+      if (step.type === 'GoToURL') {
+        await chrome.tabs.update(tabId, { url: step.url });
+        await waitForTabLoad(tabId);
+        const url = await getTabUrl(tabId);
+        if (isForbiddenUrl(url)) throw new Error('Target page is not scriptable: ' + url);
+        await ensureContentScript(tabId);
+      } else if (step.type === 'Wait') {
+        const total = Math.max(0, Number(step.ms) || 1000);
+        const until = Date.now() + total;
+        let last = -1;
+        while (Date.now() < until) {
+          const remain = Math.ceil((until - Date.now()) / 1000);
+          if (remain !== last) {
+            last = remain;
+            if (ctx && typeof ctx.parentIndex === 'number') {
+              try { broadcastToOptions({ type: 'WAIT_NESTED_COUNTDOWN', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, seconds: Math.max(0, remain) }); } catch {}
+            }
+          }
+          await wait(250);
+        }
+      } else if (step.type === 'Restart') {
+        if (typeof step._remaining !== 'number') step._remaining = (step.max === -1) ? Infinity : (Number(step.max) || 1);
+        if (step._remaining === Infinity || step._remaining > 0) {
+          if (step._remaining !== Infinity) step._remaining -= 1;
+          if (ctx && typeof ctx.parentIndex === 'number') {
+            try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, status: 'success' }); } catch {}
+          }
+          return { restartRequested: true };
+        }
+      } else if (step.type === 'If') {
+        await ensureContentScript(tabId);
+        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: { type: 'CheckElement', selector: step.selector, mode: step.mode || 'exists', timeoutMs: step.timeoutMs || 0 } });
+        const cond = Boolean(res && (res.value === true || res.ok === true && res.value !== false));
+        const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
+        if (Array.isArray(branch) && branch.length) {
+          const outcome = await runStepsInline(branch, tabId, ctx);
+          if (outcome && outcome.restartRequested) return { restartRequested: true };
+        }
+      } else {
+        await ensureContentScript(tabId);
+        let res = null;
+        if (step.type === 'WaitForEmailGmail') {
+          res = await waitForEmailGmail(step);
+        } else {
+          res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(step.forceClick) } });
+        }
+      }
+      if (ctx && typeof ctx.parentIndex === 'number') {
+        try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, status: 'success' }); } catch {}
+      }
+      const delay = Number(settings.stepDelayMs) || 0;
+      if (delay > 0) await wait(delay);
+    } catch (err) {
+      console.warn('[background] runStepsInline step failed:', err);
+      if (ctx && typeof ctx.parentIndex === 'number') {
+        try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, status: 'error' }); } catch {}
+      }
+      // continue or break? We mimic main runFlow behavior: continue
+      const delay = Number(settings.stepDelayMs) || 0;
+      if (delay > 0) await wait(delay);
+    }
   }
 }
 
@@ -453,20 +628,20 @@ async function waitForEmailGmail(step) {
 
 async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } = {}) {
   const base = "https://gmail.googleapis.com/gmail/v1/users/me";
-  // Build query: subject contains and newer_than:Xm from now. Gmail doesn't accept exact timestamps in q param,
-  // so we approximate with minutes since start. Minimum 1m.
+  const afterSeconds = newerThanMs ? Math.floor(newerThanMs / 1000) : 0;
   const minutes = Math.max(1, Math.ceil((Date.now() - newerThanMs) / 60000));
-  const buildQuery = (includeInbox) => {
+
+  const buildQuery = (includeInbox, mode) => {
     const parts = [];
     if (subject && subject.trim()) parts.push(`subject:(${subject.trim()})`);
-    parts.push(`newer_than:${minutes}m`);
+    if (mode === 'after' && afterSeconds) parts.push(`after:${afterSeconds}`);
+    if (mode === 'newer') parts.push(`newer_than:${minutes}m`);
     if (includeInbox) parts.push(`in:inbox`);
     return parts.join(" ");
   };
 
-  const SKEW_MS = 60000; // allow up to 60s negative skew for provider clock differences
-  const fetchAndFilter = async (includeInbox) => {
-    const q = buildQuery(includeInbox);
+  const SKEW_MS = 2000; // allow up to 2s negative skew for provider clock differences
+  async function fetchByQuery(q) {
     const listUrl = `${base}/messages?q=${encodeURIComponent(q)}&maxResults=5`;
     const list = await fetch(listUrl, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json());
     const items = Array.isArray(list?.messages) ? list.messages : [];
@@ -485,20 +660,31 @@ async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } 
     const strict = details.filter(d => d.subjectOk && d.timeOkStrict && (d.text || d.snippet));
     strict.sort((a, b) => b.internalDate - a.internalDate);
     if (strict.length) return strict;
+    // As a last resort, allow tiny skew
     const skew = details.filter(d => d.subjectOk && d.timeOkSkew && (d.text || d.snippet));
     skew.sort((a, b) => b.internalDate - a.internalDate);
     return skew;
-  };
-
-  // Try with inbox scope first
-  let filtered = await fetchAndFilter(true);
-  // Fallback: search anywhere if nothing found yet
-  if (!filtered.length) {
-    filtered = await fetchAndFilter(false);
   }
-  if (!filtered.length) return null;
-  const top = filtered[0];
-  return { id: top.id, snippet: top?.snippet || "", body: top?.text || "" };
+
+  // Try high-precision search first with after:SECONDS
+  for (const includeInbox of [true, false]) {
+    const qAfter = buildQuery(includeInbox, 'after');
+    const res = await fetchByQuery(qAfter);
+    if (res.length) {
+      const top = res[0];
+      return { id: top.id, snippet: top?.snippet || "", body: top?.text || "" };
+    }
+  }
+  // Fallback to minute-based
+  for (const includeInbox of [true, false]) {
+    const qNewer = buildQuery(includeInbox, 'newer');
+    const res = await fetchByQuery(qNewer);
+    if (res.length) {
+      const top = res[0];
+      return { id: top.id, snippet: top?.snippet || "", body: top?.text || "" };
+    }
+  }
+  return null;
 }
 
 function extractMessageText(msg) {
