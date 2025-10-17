@@ -364,6 +364,13 @@ async function handleRunStep(step) {
     if (!step || typeof step.type !== "string") return { ok: false, error: "invalid_step" };
     try {
         switch (step.type) {
+            case "CheckElement": {
+                const selector = typeof step.selector === 'string' ? step.selector : '';
+                const mode = (typeof step.mode === 'string' && step.mode.toLowerCase() === 'visible') ? 'visible' : 'exists';
+                const timeout = Number(step.timeoutMs) || 0;
+                const cond = await checkElementCondition(selector, mode, timeout);
+                return { ok: true, value: cond };
+            }
             case "PromptForCode": {
                 const val = window.prompt(step.message || "Enter code");
                 if (val && val.trim()) return { ok: true, value: val.trim() };
@@ -590,7 +597,58 @@ async function handleRunStep(step) {
                                 try { target.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter' })); } catch {}
 
                                 return { ok: true };
-                        }
+            }
+
+            case "SelectFiles": {
+                const timeout = Number(step.selectorWaitMs) || 5000;
+                // Find primary element from selector
+                let baseEl = await waitForSelectorSafe(step.selector, timeout);
+                if (!baseEl) return { ok: false, error: "selector_not_found" };
+
+                // Resolve input and drop target
+                const asInput = (el) => el && el.tagName && el.tagName.toLowerCase() === 'input' && ((el.getAttribute('type')||'').toLowerCase() === 'file');
+                let input = asInput(baseEl) ? baseEl : (baseEl.querySelector ? baseEl.querySelector("input[type='file']") : null);
+                if (!input) {
+                    try { input = document.querySelector(step.selector + " input[type='file']"); } catch {}
+                }
+
+                let dropEl = findDropTarget(baseEl) || baseEl;
+
+                const list = Array.isArray(step.files) ? step.files : [];
+                if (!list.length) return { ok: false, error: "no_files" };
+                // Build File objects from data URLs
+                const files = [];
+                for (const f of list) {
+                    if (!f?.dataUrl) continue;
+                    try {
+                        const file = dataUrlToFile(f.dataUrl, f.name || 'file', f.type || 'application/octet-stream');
+                        files.push(file);
+                    } catch {}
+                }
+                if (!files.length) return { ok: false, error: "files_decode_failed" };
+
+                // Create DataTransfer payload
+                const dt = new DataTransfer();
+                files.forEach(file => { try { dt.items.add(file); } catch {} });
+
+                let assigned = false;
+                if (input && asInput(input)) {
+                    try { input.focus(); } catch {}
+                    try {
+                        input.files = dt.files; // may throw or be ignored
+                        assigned = input.files && input.files.length === dt.files.length;
+                    } catch {}
+                    try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+                    try { input.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+                }
+
+                if (!assigned && dropEl) {
+                    // Drag-drop fallback on drop zone
+                    try { simulateDragDrop(dropEl, dt); assigned = true; } catch {}
+                }
+
+                return { ok: true };
+            }
 
             case "Wait":
                 await sleep(step.ms || 1000);
@@ -844,4 +902,86 @@ function syntheticClick(el, x, y) {
     } catch (e) {
         try { el.click(); } catch {}
     }
+}
+
+async function checkElementCondition(selector, mode, timeoutMs) {
+    const start = Date.now();
+    const poll = 100;
+    const test = () => {
+        let el = null;
+        try { el = document.querySelector(selector); } catch {}
+        if (!el) return false;
+        if (mode === 'exists') return true;
+        return isVisible(el);
+    };
+    if (!selector || typeof selector !== 'string') return false;
+    if (!timeoutMs || timeoutMs <= 0) return test();
+    while (Date.now() - start <= timeoutMs) {
+        if (test()) return true;
+        await sleep(poll);
+    }
+    return false;
+}
+
+function isVisible(el) {
+    try {
+        const rect = el.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+    } catch { return false; }
+    try {
+        const style = window.getComputedStyle(el);
+        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    } catch {}
+    // Also ensure within viewport area
+    return el.getClientRects().length > 0;
+}
+
+// ---- SelectFiles helpers ----
+function dataUrlToFile(dataUrl, name, type) {
+    const i = String(dataUrl).indexOf('base64,');
+    if (i === -1) throw new Error('invalid_data_url');
+    const b64 = dataUrl.slice(i + 7);
+    const binary = atob(b64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let j = 0; j < len; j++) bytes[j] = binary.charCodeAt(j);
+    return new File([bytes], name || 'file', { type: type || 'application/octet-stream' });
+}
+
+function simulateDragDrop(target, dataTransfer) {
+    if (!target) return;
+    const fire = (type, extra = {}) => {
+        try {
+            const evt = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer, ...extra });
+            target.dispatchEvent(evt);
+        } catch (err) {
+            // Fallback createEvent for environments not supporting DragEvent init with dataTransfer
+            const evt = document.createEvent('CustomEvent');
+            evt.initCustomEvent(type, true, true, null);
+            evt.dataTransfer = dataTransfer;
+            target.dispatchEvent(evt);
+        }
+    };
+    fire('dragenter');
+    fire('dragover');
+    fire('drop');
+    fire('dragleave');
+}
+
+function findDropTarget(base) {
+    if (!(base instanceof Element)) return null;
+    const isDropZone = (el) => {
+        if (!el || el.nodeType !== 1) return false;
+        if (el.hasAttribute('dropzone') || el.getAttribute('data-dropzone') != null) return true;
+        const cls = (el.className || '').toString().toLowerCase();
+        return /(dropzone|drop-zone|file-drop|uploader|upload[-_ ]area|dz-clickable|drag[- ]?and[- ]?drop|dragdrop)/.test(cls);
+    };
+    let cur = base;
+    for (let i = 0; i < 5 && cur; i++) {
+        if (isDropZone(cur)) return cur;
+        const within = cur.querySelector && cur.querySelector('[dropzone],[data-dropzone],.dropzone,.drop-zone,.file-drop,.uploader,.upload-area,.dz-clickable,[class*="drag"]');
+        if (within) return within;
+        cur = cur.parentElement;
+    }
+    return null;
 }
