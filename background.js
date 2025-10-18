@@ -57,7 +57,10 @@ const STEP_SANITIZERS = {
       if (m === -1) max = -1; // infinite
       else if (m > 0) max = Math.floor(m);
     }
-    return { type: 'Restart', max };
+    const mode = (typeof step.mode === 'string' && step.mode.toLowerCase() === 'if') ? 'if' : 'flow';
+    const idx = Number(step.ifIndex);
+    const ifIndex = Number.isFinite(idx) && idx >= 0 ? idx : -1;
+    return { type: 'Restart', max, mode, ifIndex };
   },
   SelectFiles(step) {
     const selector = typeof step.selector === "string" ? step.selector.trim() : "";
@@ -138,6 +141,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     })();
     return true; // async sendResponse için kanalı açık tut
+  }
+
+  if (msg.type === "QUERY_FLOW_STATE") {
+    try { sendResponse({ ok: true, running: Boolean(isFlowRunning) }); } catch {}
+    return true;
   }
 
   if (msg.type === "RUN_SINGLE_STEP") {
@@ -419,9 +427,8 @@ async function runFlow(flow, tabId) {
 
   // notify options to reset statuses
   broadcastToOptions({ type: "FLOW_STATUS", kind: "FLOW_RESET" });
-  // iteration counter
+  // iteration counter (only broadcast on completion)
   let iterCount = 0;
-  try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
   let aborted = false;
 
   for (let i = 0; i < flow.length; i++) {
@@ -455,9 +462,12 @@ async function runFlow(flow, tabId) {
         if (step._remaining === Infinity || step._remaining > 0) {
           if (step._remaining !== Infinity) step._remaining -= 1;
           // reset statuses and restart from the beginning
-          iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
           broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
-          i = -1; // next loop starts at 0
+          if (step.mode === 'if' && Number.isFinite(step.ifIndex) && step.ifIndex >= 0 && step.ifIndex < flow.length && flow[step.ifIndex]?.type === 'If') {
+            i = step.ifIndex - 1; // jump to selected If (next loop increments)
+          } else {
+            i = -1; // flow start
+          }
         }
       } else if (step.type === 'If') {
         await ensureContentScript(tabId);
@@ -468,9 +478,12 @@ async function runFlow(flow, tabId) {
         if (Array.isArray(branch) && branch.length) {
           const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else', path: [i, (cond ? 'then' : 'else')] });
           if (outcome && outcome.restartRequested) {
-            iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
             broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
-            i = -1; // restart
+            if (Number.isFinite(outcome.jumpToIfIndex) && outcome.jumpToIfIndex >= 0 && outcome.jumpToIfIndex < flow.length && flow[outcome.jumpToIfIndex]?.type === 'If') {
+              i = outcome.jumpToIfIndex - 1;
+            } else {
+              i = -1;
+            }
           }
         }
       } else {
@@ -496,6 +509,8 @@ async function runFlow(flow, tabId) {
   }
   if (!aborted) {
     iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
+  } else {
+    try { broadcastToOptions({ type: 'FLOW_ABORT' }); } catch {}
   }
 }
 
@@ -541,11 +556,12 @@ async function runStepsInline(steps, tabId, ctx) {
         if (typeof step._remaining !== 'number') step._remaining = (step.max === -1) ? Infinity : (Number(step.max) || 1);
         if (step._remaining === Infinity || step._remaining > 0) {
           if (step._remaining !== Infinity) step._remaining -= 1;
+          const jump = (step.mode === 'if' && Number.isFinite(step.ifIndex) && step.ifIndex >= 0) ? step.ifIndex : null;
           if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
             const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
             try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, status: 'success' }); } catch {}
           }
-          return { restartRequested: true };
+          return { restartRequested: true, jumpToIfIndex: jump };
         }
       } else if (step.type === 'If') {
         await ensureContentScript(tabId);
@@ -926,6 +942,7 @@ async function mirrorUiStateToStorage(payload) {
         ui.ifResults = {};
         ui.waitCountdowns = {};
         ui.nestedWaitCountdowns = {};
+        ui.isRunning = true;
       } else if (typeof payload.index === 'number' && payload.status) {
         const arr = Array.isArray(ui.stepStatuses) ? ui.stepStatuses.slice() : [];
         arr[payload.index] = payload.status;
@@ -965,6 +982,9 @@ async function mirrorUiStateToStorage(payload) {
       }
     } else if (payload?.type === 'FLOW_ITER') {
       ui.iterCount = Number(payload.count) || 0;
+      ui.isRunning = false;
+    } else if (payload?.type === 'FLOW_ABORT') {
+      ui.isRunning = false;
     }
     await chrome.storage.local.set({ [key]: ui });
   } catch (err) {
