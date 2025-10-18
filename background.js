@@ -463,6 +463,7 @@ async function runFlow(flow, tabId) {
           if (step._remaining !== Infinity) step._remaining -= 1;
           // reset statuses and restart from the beginning
           broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+          iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
           if (step.mode === 'if' && Number.isFinite(step.ifIndex) && step.ifIndex >= 0 && step.ifIndex < flow.length && flow[step.ifIndex]?.type === 'If') {
             i = step.ifIndex - 1; // jump to selected If (next loop increments)
           } else {
@@ -479,6 +480,7 @@ async function runFlow(flow, tabId) {
           const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else', path: [i, (cond ? 'then' : 'else')] });
           if (outcome && outcome.restartRequested) {
             broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+            iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
             if (Number.isFinite(outcome.jumpToIfIndex) && outcome.jumpToIfIndex >= 0 && outcome.jumpToIfIndex < flow.length && flow[outcome.jumpToIfIndex]?.type === 'If') {
               i = outcome.jumpToIfIndex - 1;
             } else {
@@ -981,8 +983,15 @@ async function mirrorUiStateToStorage(payload) {
         ui.nestedWaitCountdowns = map;
       }
     } else if (payload?.type === 'FLOW_ITER') {
-      ui.iterCount = Number(payload.count) || 0;
+      // Persistently increment total completed runs
+      const prev = Number(ui.iterCount) || 0;
+      ui.iterCount = prev + 1;
       ui.isRunning = false;
+      try {
+        const t = await chrome.storage.local.get(['runCountTotal']);
+        const total = Number(t?.runCountTotal) || 0;
+        await chrome.storage.local.set({ runCountTotal: total + 1 });
+      } catch {}
     } else if (payload?.type === 'FLOW_ABORT') {
       ui.isRunning = false;
     }
