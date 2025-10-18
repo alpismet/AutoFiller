@@ -1871,13 +1871,24 @@ function onDocumentDrop(event) {
   if (!dndState.active) return;
   event.preventDefault();
   const srcPath = dndState.srcPath ? dndState.srcPath.slice() : null;
-  const targetCtx = dndState.targetValid ? dndState.targetCtx : null;
+  let targetCtx = dndState.targetValid ? dndState.targetCtx : null;
   let targetIndex = dndState.targetValid ? dndState.targetIndex : -1;
-  // determine index from event target if we lost it
+  let targetList = dndState.targetValid ? dndState.targetList : null;
+
+  if (!targetCtx) {
+    targetList = findListElement(event.target);
+    targetCtx = getContextFromList(targetList);
+  }
+
+  if (targetCtx && srcPath) {
+    targetCtx = adjustContextForRemoval(targetCtx, srcPath);
+  }
+
   if (targetCtx && targetIndex < 0) {
-    const listEl = findListElement(event.target) || dndState.targetList;
+    const listEl = targetList || findListElement(event.target);
     if (listEl) targetIndex = computeDropIndex(listEl, event.clientY);
   }
+
   resetDndState();
   if (!srcPath || !targetCtx) return;
   const changed = applyMoveStep(srcPath, targetCtx, targetIndex);
@@ -2014,6 +2025,78 @@ function parsePath(raw) {
   }
 }
 
+function containersFromPath(path) {
+  if (!Array.isArray(path) || path.length === 0) return [];
+  const containers = [{ branch: 'root', index: path[0] }];
+  for (let i = 1; i < path.length; i += 2) {
+    const branch = path[i];
+    const index = path[i + 1];
+    if (typeof index === 'number') {
+      containers.push({ branch, index });
+    }
+  }
+  return containers;
+}
+
+function containersToPath(containers) {
+  if (!Array.isArray(containers) || containers.length === 0) return [];
+  const path = [];
+  containers.forEach((container, idx) => {
+    if (idx === 0) {
+      path.push(container.index);
+    } else {
+      path.push(container.branch);
+      path.push(container.index);
+    }
+  });
+  return path;
+}
+
+function adjustContextForRemoval(targetCtx, srcPath) {
+  if (!targetCtx || targetCtx.type !== 'branch') return targetCtx;
+  const hostPath = Array.isArray(targetCtx.hostPath) ? targetCtx.hostPath : [];
+  const adjustedPath = adjustHostPathForRemoval(hostPath, srcPath);
+  if (!adjustedPath) return targetCtx;
+  if (arraysEqual(hostPath, adjustedPath)) return targetCtx;
+  return { ...targetCtx, hostPath: adjustedPath };
+}
+
+function adjustHostPathForRemoval(hostPath, srcPath) {
+  if (!Array.isArray(hostPath) || !Array.isArray(srcPath)) return hostPath;
+  const hostContainers = containersFromPath(hostPath).map((c) => ({ ...c }));
+  const srcContainers = containersFromPath(srcPath);
+  if (!hostContainers.length || !srcContainers.length) return hostPath;
+  const max = Math.min(hostContainers.length, srcContainers.length);
+  for (let level = 0; level < max; level++) {
+    let matches = true;
+    for (let parent = 0; parent < level; parent++) {
+      const hc = hostContainers[parent];
+      const sc = srcContainers[parent];
+      if (!hc || !sc || hc.branch !== sc.branch || hc.index !== sc.index) {
+        matches = false;
+        break;
+      }
+    }
+    if (!matches) break;
+    const hc = hostContainers[level];
+    const sc = srcContainers[level];
+    if (!hc || !sc) break;
+    if (hc.branch === sc.branch && hc.index > sc.index) {
+      hc.index -= 1;
+    }
+  }
+  return containersToPath(hostContainers);
+}
+
+function arraysEqual(a, b) {
+  if (a === b) return true;
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 function isDropIntoOwnSubtree(srcPath, targetCtx) {
   if (!Array.isArray(srcPath) || !targetCtx) return true;
   if (targetCtx.type !== 'branch') return false;
@@ -2126,13 +2209,14 @@ function resetFlowStatuses() {
 
 function applyMoveStep(srcPath, targetCtx, rawIndex) {
   if (!Array.isArray(srcPath) || !targetCtx) return false;
+  const adjustedCtx = adjustContextForRemoval(targetCtx, srcPath);
   const removal = removeStepAtPath(srcPath);
   if (!removal) return false;
   const { step, status, ctx: srcCtx, index: originalIndex } = removal;
   let insertIndex = Number.isInteger(rawIndex) ? rawIndex : 0;
   insertIndex = Math.max(0, insertIndex);
-  const sameContainer = contextsMatch(srcCtx, targetCtx);
-  insertStepIntoContext(step, targetCtx, insertIndex, status);
+  const sameContainer = contextsMatch(srcCtx, adjustedCtx);
+  insertStepIntoContext(step, adjustedCtx, insertIndex, status);
   const noChange = sameContainer && originalIndex === insertIndex;
   if (!noChange) {
     resetFlowStatuses();
