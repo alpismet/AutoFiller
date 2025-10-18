@@ -12,6 +12,7 @@ const OFFSCREEN_DOCUMENT_URL = "offscreen.html";
 let offscreenCreationPromise = null;
 let activePicker = null;
 let isFlowRunning = false;
+let stopRequested = false;
 const STEP_SANITIZERS = {
   GoToURL(step) {
     const url = typeof step.url === "string" ? step.url.trim() : "";
@@ -115,6 +116,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         isFlowRunning = true;
+        stopRequested = false;
         const flow = await fetchActiveFlow();
         if (!flow.length) {
           throw new Error("Flow is empty. Configure steps in the options page.");
@@ -189,7 +191,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           try { if (index >= 0) broadcastToOptions({ type: 'IF_RESULT', index, result: cond ? 'then' : 'else' }); } catch {}
           const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
           if (Array.isArray(branch) && branch.length) {
-            await runStepsInline(branch, targetTabId, { parentIndex: index, branchKey: cond ? 'then' : 'else' });
+            await runStepsInline(branch, targetTabId, { parentIndex: index, branchKey: cond ? 'then' : 'else', path: [index, (cond ? 'then' : 'else')] });
           }
         } else if (step.type === "WaitForEmailGmail") {
           const res = await waitForEmailGmail(step);
@@ -237,6 +239,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } catch (err) {
         console.warn("[background] Failed to delegate audio playback:", err);
         sendResponse({ ok: false, error: String(err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === "STOP_FLOW") {
+    (async () => {
+      try {
+        stopRequested = true;
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e) });
       }
     })();
     return true;
@@ -411,6 +425,7 @@ async function runFlow(flow, tabId) {
     console.log("→ Running step:", step.type);
     broadcastToOptions({ type: "FLOW_STATUS", index: i, status: "running" });
     try {
+      if (stopRequested) throw new Error('aborted');
       if (step.type === "GoToURL") {
         await chrome.tabs.update(tabId, { url: step.url });
         await waitForTabLoad(tabId);
@@ -427,6 +442,7 @@ async function runFlow(flow, tabId) {
             last = remain;
             try { broadcastToOptions({ type: 'WAIT_COUNTDOWN', index: i, seconds: Math.max(0, remain) }); } catch {}
           }
+          if (stopRequested) throw new Error('aborted');
           await wait(250);
         }
       } else if (step.type === 'Restart') {
@@ -445,7 +461,7 @@ async function runFlow(flow, tabId) {
         try { broadcastToOptions({ type: 'IF_RESULT', index: i, result: cond ? 'then' : 'else' }); } catch {}
         const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
         if (Array.isArray(branch) && branch.length) {
-          const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else' });
+          const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else', path: [i, (cond ? 'then' : 'else')] });
           if (outcome && outcome.restartRequested) {
             broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
             i = -1; // restart
@@ -466,7 +482,7 @@ async function runFlow(flow, tabId) {
       console.warn("[background] Step failed:", err);
       broadcastToOptions({ type: "FLOW_STATUS", index: i, status: "error", error: String(err) });
       // stop on error or continue? For now, stop
-      throw err;
+      break;
     }
     const delay = Math.max(0, Number(settings.stepDelayMs) || 0);
     if (delay) await wait(delay);
@@ -484,8 +500,10 @@ async function runStepsInline(steps, tabId, ctx) {
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     try {
-      if (ctx && typeof ctx.parentIndex === 'number') {
-        try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, status: 'running' }); } catch {}
+      if (stopRequested) throw new Error('aborted');
+      if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
+        const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
+        try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, status: 'running' }); } catch {}
       }
       if (step.type === 'GoToURL') {
         await chrome.tabs.update(tabId, { url: step.url });
@@ -501,18 +519,21 @@ async function runStepsInline(steps, tabId, ctx) {
           const remain = Math.ceil((until - Date.now()) / 1000);
           if (remain !== last) {
             last = remain;
-            if (ctx && typeof ctx.parentIndex === 'number') {
-              try { broadcastToOptions({ type: 'WAIT_NESTED_COUNTDOWN', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, seconds: Math.max(0, remain) }); } catch {}
+            if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
+              const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
+              try { broadcastToOptions({ type: 'WAIT_NESTED_COUNTDOWN', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, seconds: Math.max(0, remain) }); } catch {}
             }
           }
+          if (stopRequested) throw new Error('aborted');
           await wait(250);
         }
       } else if (step.type === 'Restart') {
         if (typeof step._remaining !== 'number') step._remaining = (step.max === -1) ? Infinity : (Number(step.max) || 1);
         if (step._remaining === Infinity || step._remaining > 0) {
           if (step._remaining !== Infinity) step._remaining -= 1;
-          if (ctx && typeof ctx.parentIndex === 'number') {
-            try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, status: 'success' }); } catch {}
+          if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
+            const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
+            try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, status: 'success' }); } catch {}
           }
           return { restartRequested: true };
         }
@@ -522,7 +543,8 @@ async function runStepsInline(steps, tabId, ctx) {
         const cond = Boolean(res && (res.value === true || res.ok === true && res.value !== false));
         const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
         if (Array.isArray(branch) && branch.length) {
-          const outcome = await runStepsInline(branch, tabId, ctx);
+          const path = Array.isArray(ctx.path) ? ctx.path.concat(i, (cond ? 'then' : 'else')) : [ctx.parentIndex, ctx.branchKey || 'then', i, (cond ? 'then' : 'else')];
+          const outcome = await runStepsInline(branch, tabId, { ...ctx, path });
           if (outcome && outcome.restartRequested) return { restartRequested: true };
         }
       } else {
@@ -534,15 +556,17 @@ async function runStepsInline(steps, tabId, ctx) {
           res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(step.forceClick) } });
         }
       }
-      if (ctx && typeof ctx.parentIndex === 'number') {
-        try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, status: 'success' }); } catch {}
+      if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
+        const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
+        try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, status: 'success' }); } catch {}
       }
       const delay = Number(settings.stepDelayMs) || 0;
       if (delay > 0) await wait(delay);
     } catch (err) {
       console.warn('[background] runStepsInline step failed:', err);
-      if (ctx && typeof ctx.parentIndex === 'number') {
-        try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, status: 'error' }); } catch {}
+      if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
+        const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
+        try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, status: 'error' }); } catch {}
       }
       // continue or break? We mimic main runFlow behavior: continue
       const delay = Number(settings.stepDelayMs) || 0;
@@ -774,6 +798,7 @@ function broadcastToOptions(payload) {
     // Fire-and-forget without a callback to avoid Unchecked runtime.lastError
     chrome.runtime.sendMessage(payload);
   } catch {}
+  try { mirrorUiStateToStorage(payload); } catch {}
 }
 
 function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -877,4 +902,60 @@ function sendMessageToOffscreen(payload) {
       reject(err);
     }
   });
+}
+
+async function mirrorUiStateToStorage(payload) {
+  const key = 'flowUiState';
+  try {
+    const cur = await chrome.storage.local.get([key]);
+    const ui = { ...(cur?.[key] || {}), lastUpdatedAt: Date.now() };
+    if (payload?.type === 'FLOW_STATUS') {
+      if (payload.kind === 'FLOW_RESET') {
+        ui.stepStatuses = [];
+        ui.nestedStatuses = {};
+        ui.ifResults = {};
+        ui.waitCountdowns = {};
+        ui.nestedWaitCountdowns = {};
+      } else if (typeof payload.index === 'number' && payload.status) {
+        const arr = Array.isArray(ui.stepStatuses) ? ui.stepStatuses.slice() : [];
+        arr[payload.index] = payload.status;
+        ui.stepStatuses = arr;
+        if (payload.status === 'success' || payload.status === 'error') {
+          if (ui.waitCountdowns) delete ui.waitCountdowns[payload.index];
+        }
+      }
+    } else if (payload?.type === 'FLOW_NESTED_STATUS') {
+      const key = Array.isArray(payload.path) ? payload.path.map(String).join('|') : (typeof payload.parentIndex === 'number' && typeof payload.childIndex === 'number' && typeof payload.branch === 'string' ? `${payload.parentIndex}|${payload.branch}|${payload.childIndex}` : null);
+      if (key && payload.status) {
+        const map = { ...(ui.nestedStatuses || {}) };
+        map[key] = payload.status;
+        ui.nestedStatuses = map;
+        if (payload.status === 'success' || payload.status === 'error') {
+          if (ui.nestedWaitCountdowns) delete ui.nestedWaitCountdowns[key];
+        }
+      }
+    } else if (payload?.type === 'IF_RESULT') {
+      if (typeof payload.index === 'number') {
+        const map = { ...(ui.ifResults || {}) };
+        map[payload.index] = payload.result === 'then' ? 'then' : 'else';
+        ui.ifResults = map;
+      }
+    } else if (payload?.type === 'WAIT_COUNTDOWN') {
+      if (typeof payload.index === 'number') {
+        const map = { ...(ui.waitCountdowns || {}) };
+        map[payload.index] = Math.max(0, Number(payload.seconds) || 0);
+        ui.waitCountdowns = map;
+      }
+    } else if (payload?.type === 'WAIT_NESTED_COUNTDOWN') {
+      const key = Array.isArray(payload.path) ? payload.path.map(String).join('|') : (typeof payload.parentIndex === 'number' && typeof payload.childIndex === 'number' && typeof payload.branch === 'string' ? `${payload.parentIndex}|${payload.branch}|${payload.childIndex}` : null);
+      if (key) {
+        const map = { ...(ui.nestedWaitCountdowns || {}) };
+        map[key] = Math.max(0, Number(payload.seconds) || 0);
+        ui.nestedWaitCountdowns = map;
+      }
+    }
+    await chrome.storage.local.set({ [key]: ui });
+  } catch (err) {
+    // best-effort
+  }
 }

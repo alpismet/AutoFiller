@@ -140,6 +140,7 @@ const els = {
   exportFlow: document.getElementById("exportFlow"),
   importFlow: document.getElementById("importFlow"),
   runFlow: document.getElementById("runFlow"),
+  stopFlow: document.getElementById("stopFlow"),
   status: document.getElementById("status"),
   stepTemplate: document.getElementById("step-template"),
   flowName: document.getElementById("flowName"),
@@ -254,6 +255,7 @@ function wireEvents() {
     state.ifResults = {};
     state.waitCountdowns = {};
     state.nestedWaitCountdowns = {};
+    try { chrome.storage.local.remove('flowUiState'); } catch {}
     render();
     setDirty(true);
     showStatus("Loaded default flow. Save to persist.");
@@ -270,6 +272,7 @@ function wireEvents() {
       const text = await file.text();
       const payload = JSON.parse(text);
       applyImportedFlow(payload);
+      try { await chrome.storage.local.remove('flowUiState'); } catch {}
       render();
       setDirty(true);
       showStatus("Imported flow. Save to persist.");
@@ -288,6 +291,15 @@ function wireEvents() {
     const ok = await triggerRunFlow();
     if (ok) {
       showStatus("Flow dispatched to active tab.");
+    }
+  });
+
+  els.stopFlow?.addEventListener("click", async () => {
+    try {
+      await chrome.runtime.sendMessage({ type: "STOP_FLOW" });
+      showStatus("Stop requested.");
+    } catch (err) {
+      console.warn("[options] Stop flow error:", err);
     }
   });
 
@@ -364,13 +376,20 @@ function wireEvents() {
 
 async function loadFromStorage() {
   try {
-    const { activeFlow, flowName, settings } = await chrome.storage.local.get(["activeFlow", "flowName", "settings"]);
+    const { activeFlow, flowName, settings, flowUiState } = await chrome.storage.local.get(["activeFlow", "flowName", "settings", "flowUiState"]);
     const sanitized = sanitizeFlowArray(activeFlow);
     state.steps = sanitized.length ? sanitized : cloneFlow(DEFAULT_FLOW);
     state.flowName = typeof flowName === "string" && flowName.trim() ? flowName : DEFAULT_FLOW_NAME;
     state.settings = { ...DEFAULT_SETTINGS, ...(settings || {}) };
-    // initialize statuses
-    state.stepStatuses = state.steps.map(() => "idle");
+    // restore statuses if available
+    const ui = flowUiState || {};
+    const baseStatuses = Array.isArray(ui.stepStatuses) ? ui.stepStatuses.slice() : [];
+    // ensure length matches steps
+    state.stepStatuses = state.steps.map((_, i) => baseStatuses[i] || "idle");
+    state.nestedStatuses = typeof ui.nestedStatuses === 'object' && ui.nestedStatuses ? ui.nestedStatuses : {};
+    state.ifResults = typeof ui.ifResults === 'object' && ui.ifResults ? ui.ifResults : {};
+    state.waitCountdowns = typeof ui.waitCountdowns === 'object' && ui.waitCountdowns ? ui.waitCountdowns : {};
+    state.nestedWaitCountdowns = typeof ui.nestedWaitCountdowns === 'object' && ui.nestedWaitCountdowns ? ui.nestedWaitCountdowns : {};
     snapshotAsSaved();
     setDirty(false, { silent: true });
   } catch (err) {
@@ -379,6 +398,10 @@ async function loadFromStorage() {
     state.flowName = DEFAULT_FLOW_NAME;
     state.settings = { ...DEFAULT_SETTINGS };
     state.stepStatuses = state.steps.map(() => "idle");
+    state.nestedStatuses = {};
+    state.ifResults = {};
+    state.waitCountdowns = {};
+    state.nestedWaitCountdowns = {};
     snapshotAsSaved();
     setDirty(false, { silent: true });
   }
@@ -520,25 +543,25 @@ async function runSingleStep(index) {
     if (!isEmpty) prepared[field.key] = field.type === "number" ? Number(value) : (typeof value === "string" ? value.trim() : value);
   }
   if (prepared.type === 'If') {
-    const prepBranch = (arr) => {
-      const out = [];
-      (Array.isArray(arr) ? arr : []).forEach((child) => {
-        const s = STEP_LIBRARY_MAP.get(child.type);
-        if (!s) return;
-        const c = { type: child.type };
-        s.fields.forEach((f) => {
-          const v = child[f.key];
-          if (v !== undefined && v !== null && !(typeof v === 'string' && v.trim() === '')) {
-            c[f.key] = f.type === 'number' ? Number(v) : (typeof v === 'string' ? v.trim() : v);
-          }
-        });
-        if (child.type === 'Click' && child.forceClick !== undefined) c.forceClick = Boolean(child.forceClick);
-        out.push(c);
+    const prepChild = (child) => {
+      const s = STEP_LIBRARY_MAP.get(child.type);
+      if (!s) return null;
+      const c = { type: child.type };
+      s.fields.forEach((f) => {
+        const v = child[f.key];
+        if (v !== undefined && v !== null && !(typeof v === 'string' && v.trim() === '')) {
+          c[f.key] = f.type === 'number' ? Number(v) : (typeof v === 'string' ? v.trim() : v);
+        }
       });
-      return out;
+      if (child.type === 'Click' && child.forceClick !== undefined) c.forceClick = Boolean(child.forceClick);
+      if (child.type === 'If') {
+        c.then = (Array.isArray(child.then) ? child.then : []).map(prepChild).filter(Boolean);
+        c.else = (Array.isArray(child.else) ? child.else : []).map(prepChild).filter(Boolean);
+      }
+      return c;
     };
-    prepared.then = prepBranch(state.steps[index]?.then);
-    prepared.else = prepBranch(state.steps[index]?.else);
+    prepared.then = (Array.isArray(state.steps[index]?.then) ? state.steps[index].then : []).map(prepChild).filter(Boolean);
+    prepared.else = (Array.isArray(state.steps[index]?.else) ? state.steps[index].else : []).map(prepChild).filter(Boolean);
   }
   // Send to background to run single step
   try {
@@ -1000,7 +1023,7 @@ function createNestedStepCard(parentIndex, branchKey, childIndex, step, branchLa
   const chip = card.querySelector(".step-status .status-chip");
   const chipIcon = card.querySelector(".chip-icon");
   const chipLabel = card.querySelector(".chip-label");
-  const key = `${parentIndex}|${branchKey}|${childIndex}`;
+  const key = [parentIndex, branchKey, childIndex].map(String).join('|');
   const stName = state.nestedStatuses[key] || 'idle';
   const meta = RUN_STATUS_META[stName] || RUN_STATUS_META.idle;
   chipIcon.textContent = meta.icon;
@@ -1047,7 +1070,7 @@ function createNestedStepCard(parentIndex, branchKey, childIndex, step, branchLa
     });
   });
 
-  buildFieldsNested(fieldsContainer, schema, step, { parentIndex, branchKey, childIndex });
+  buildFieldsNested(fieldsContainer, schema, step, { parentIndex, branchKey, childIndex, path: [parentIndex, branchKey, childIndex] });
   return card;
 }
 
@@ -1166,7 +1189,7 @@ function buildFieldsNested(container, schema, step, ctx) {
     else { input.addEventListener("input", (e) => { setDirty(true, { silent: true }); updateNestedFieldValue(ctx.parentIndex, ctx.branchKey, ctx.childIndex, field, e.target.value); }); }
 
     let inputHost = input;
-    if (field.supportsPicker) {
+    if (field.supportsPicker && !(ctx && ctx.depth > 0)) {
       const row = document.createElement("div"); row.className = "input-row";
       const btn = document.createElement("button"); btn.type = "button"; btn.className = "icon picker-btn"; btn.title = "Pick element from active tab"; btn.textContent = "🎯";
       const isActive = isPickerContext(undefined, field.key, ctx);
@@ -1214,6 +1237,231 @@ function buildFieldsNested(container, schema, step, ctx) {
     }
     container.appendChild(fieldWrapper);
   });
+
+  // If this nested step is an If, render its Then/Else branches as deep-nested lists
+  if (schema.type === 'If') {
+    const host = document.createElement('div');
+    host.style.display = 'grid';
+    host.style.gap = '8px';
+    container.appendChild(host);
+    const basePath = Array.isArray(ctx.path) ? ctx.path.slice() : [ctx.parentIndex, ctx.branchKey, ctx.childIndex];
+    renderIfBranchesDeep(host, { ...ctx, path: basePath });
+  }
+}
+
+function renderIfBranchesDeep(container, ctx) {
+  const stepRef = () => {
+    const p = state.steps[ctx.parentIndex];
+    if (!p) return null;
+    const arr = Array.isArray(p[ctx.branchKey]) ? p[ctx.branchKey] : [];
+    return arr[ctx.childIndex] || null; // this is the nested If step
+  };
+
+  const makeBranch = (key, labelText) => {
+    const section = document.createElement('div');
+    section.className = 'field';
+    const label = document.createElement('label'); label.textContent = labelText; section.appendChild(label);
+    const list = document.createElement('div'); list.className = 'flows'; section.appendChild(list);
+    const actions = document.createElement('div'); actions.style.display = 'flex'; actions.style.gap = '8px';
+    const add = document.createElement('button'); add.type = 'button'; add.textContent = '＋ Add Step';
+    add.addEventListener('click', () => {
+      const st = stepRef(); if (!st) return;
+      const arr = Array.isArray(st[key]) ? st[key] : [];
+      const defType = STEP_LIBRARY[0].type;
+      const schema = STEP_LIBRARY_MAP.get(defType) || STEP_LIBRARY[0];
+      const s = createStepFromSchema(schema);
+      arr.push(s);
+      st[key] = arr;
+      setDirty(true, { silent: true });
+      render();
+    });
+    actions.appendChild(add); section.appendChild(actions);
+
+    const st = stepRef();
+    const branch = Array.isArray(st?.[key]) ? st[key] : [];
+    branch.forEach((child, idx) => {
+      const card = createDeepNestedStepCard(ctx, key, idx, child, labelText);
+      list.appendChild(card);
+    });
+    return section;
+  };
+
+  container.appendChild(makeBranch('then', 'Then'));
+  container.appendChild(makeBranch('else', 'Else'));
+}
+
+function createDeepNestedStepCard(parentCtx, nestedKey, childIndex, step, branchLabel) {
+  const template = els.stepTemplate;
+  const schema = STEP_LIBRARY_MAP.get(step.type) || STEP_LIBRARY[0];
+  const fragment = template.content.cloneNode(true);
+  const card = fragment.querySelector('.step-card');
+  const title = card.querySelector('.step-title');
+  const typeSelect = card.querySelector('.step-type');
+  const fieldsContainer = card.querySelector('.step-fields');
+  // status chip for deep-nested with path-based status
+  const chip = card.querySelector('.step-status .status-chip');
+  const chipIcon = card.querySelector('.chip-icon');
+  const chipLabel = card.querySelector('.chip-label');
+  const key = [...(Array.isArray(parentCtx.path) ? parentCtx.path : [parentCtx.parentIndex, parentCtx.branchKey, parentCtx.childIndex]), nestedKey, childIndex].map(String).join('|');
+  const stName = state.nestedStatuses[key] || 'idle';
+  const meta = RUN_STATUS_META[stName] || RUN_STATUS_META.idle;
+  chipIcon.textContent = meta.icon;
+  let label = meta.label;
+  if (schema.type === 'Wait' && stName === 'running') {
+    const sec = state.nestedWaitCountdowns?.[key];
+    if (Number.isFinite(sec) && sec > 0) label = `Running — ${sec}s`;
+  }
+  chipLabel.textContent = label;
+  chip.className = `status-chip ${meta.className}`;
+
+  title.textContent = `${branchLabel} ${childIndex + 1} — ${schema?.label || step.type}`;
+
+  STEP_LIBRARY.forEach((item) => {
+    const option = document.createElement('option');
+    option.value = item.type; option.textContent = item.label; option.selected = item.type === step.type;
+    typeSelect.appendChild(option);
+  });
+  typeSelect.addEventListener('change', (e) => {
+    updateDeepNestedStepType(parentCtx, nestedKey, childIndex, e.target.value);
+    render(); setDirty(true);
+  });
+
+  const actions = card.querySelectorAll('.step-actions [data-action]');
+  actions.forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const action = btn.dataset.action;
+      if (action === 'delete') deleteDeepNestedStep(parentCtx, nestedKey, childIndex);
+      else if (action === 'up') moveDeepNestedStep(parentCtx, nestedKey, childIndex, -1);
+      else if (action === 'down') moveDeepNestedStep(parentCtx, nestedKey, childIndex, +1);
+      else if (action === 'run') await runDeepNestedStep(parentCtx, nestedKey, childIndex);
+    });
+  });
+
+  buildFieldsDeep(fieldsContainer, schema, step, parentCtx, nestedKey, childIndex);
+  return card;
+}
+
+function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childIndex) {
+  container.innerHTML = '';
+  schema.fields.forEach((field) => {
+    // For deep nested, keep it simple (no picker)
+    const wrap = document.createElement('div'); wrap.className = 'field';
+    const label = document.createElement('label'); label.textContent = field.label; wrap.appendChild(label);
+
+    // Special FillText extras
+    if (schema.type === 'FillText' && field.key === 'value') {
+      const inputSection = document.createElement('div'); inputSection.className = 'field';
+      const secLabel = document.createElement('label'); secLabel.textContent = 'Input';
+      const row = document.createElement('div'); row.className = 'input-row'; row.style.justifyContent = 'flex-start'; row.style.gap = '8px';
+      const splitBtn = document.createElement('button'); splitBtn.type = 'button'; splitBtn.className = 'toggle'; splitBtn.title = 'Split across multiple inputs (OTP)'; splitBtn.textContent = '🔢';
+      const applySplitState = () => { const st = getDeepNestedStep(parentCtx, nestedKey, childIndex); const active = Boolean(st?.splitAcrossInputs); splitBtn.classList.toggle('active', active); };
+      applySplitState();
+      splitBtn.addEventListener('click', () => { const st = getDeepNestedStep(parentCtx, nestedKey, childIndex); st.splitAcrossInputs = !Boolean(st?.splitAcrossInputs); applySplitState(); setDirty(true, { silent: true }); });
+      row.appendChild(splitBtn);
+      const slowBtn = document.createElement('button'); slowBtn.type = 'button'; slowBtn.className = 'toggle'; slowBtn.title = 'Slow typing'; slowBtn.textContent = '🐢';
+      const delayInput = document.createElement('input'); delayInput.type = 'number'; delayInput.min = '0'; delayInput.step = '10'; delayInput.placeholder = '100'; delayInput.style.marginLeft = '8px';
+      const applySlowState = () => { const st = getDeepNestedStep(parentCtx, nestedKey, childIndex); const active = Boolean(st?.slowType); slowBtn.classList.toggle('active', active); delayInput.style.display = active ? '' : 'none'; const cur = st?.slowTypeDelayMs; delayInput.value = String(Number.isFinite(cur) ? cur : 100); };
+      applySlowState();
+      slowBtn.addEventListener('click', () => { const st = getDeepNestedStep(parentCtx, nestedKey, childIndex); st.slowType = !Boolean(st?.slowType); applySlowState(); setDirty(true, { silent: true }); });
+      delayInput.addEventListener('input', (e) => { const v = Number(e.target.value); if (Number.isFinite(v) && v >= 0) { const st = getDeepNestedStep(parentCtx, nestedKey, childIndex); st.slowTypeDelayMs = v; setDirty(true, { silent: true }); } });
+      inputSection.appendChild(secLabel); inputSection.appendChild(row); container.appendChild(inputSection);
+    }
+
+    let input;
+    if (field.type === 'textarea') input = document.createElement('textarea');
+    else if (field.type === 'select') { input = document.createElement('select'); (field.options || []).forEach((opt) => { const o = document.createElement('option'); o.value = String(opt.value); o.textContent = String(opt.label ?? opt.value); input.appendChild(o); }); }
+    else if (field.type === 'checkbox') { input = document.createElement('input'); input.type = 'checkbox'; }
+    else if (field.type === 'filelist') { input = document.createElement('div'); input.textContent = 'Unsupported field type'; }
+    else { input = document.createElement('input'); input.type = field.type === 'number' ? 'number' : (field.type === 'url' ? 'url' : 'text'); }
+    input.placeholder = field.placeholder || '';
+    if (field.type === 'number') { if (typeof field.min !== 'undefined') input.min = String(field.min); if (typeof field.max !== 'undefined') input.max = String(field.max); if (typeof field.step !== 'undefined') input.step = String(field.step); }
+    const existing = step[field.key];
+    if (field.type === 'checkbox') { if (existing !== undefined && existing !== null) input.checked = Boolean(existing); else if (field.default !== undefined) input.checked = Boolean(field.default); }
+    else if (field.type === 'select') { if (existing !== undefined && existing !== null) input.value = String(existing); else if (field.default !== undefined) input.value = String(field.default); }
+    else { if (existing !== undefined && existing !== null) input.value = String(existing); else if (field.default !== undefined) input.value = String(field.default); }
+    if (field.type === 'checkbox') { input.addEventListener('change', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, Boolean(e.target.checked)); }); }
+    else if (field.type === 'select') { input.addEventListener('change', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, e.target.value); }); }
+    else { input.addEventListener('input', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, e.target.value); }); }
+    wrap.appendChild(input);
+    container.appendChild(wrap);
+  });
+
+  // If this deep-nested step is an If, render its own Then/Else recursively
+  if (schema.type === 'If') {
+    const host = document.createElement('div');
+    host.style.display = 'grid';
+    host.style.gap = '8px';
+    container.appendChild(host);
+    const basePath = [...(Array.isArray(parentCtx.path) ? parentCtx.path : [parentCtx.parentIndex, parentCtx.branchKey, parentCtx.childIndex]), nestedKey, childIndex];
+    renderIfBranchesDeep(host, { parentIndex: parentCtx.parentIndex, branchKey: parentCtx.branchKey, childIndex: parentCtx.childIndex, path: basePath });
+  }
+}
+
+function getDeepNestedStep(parentCtx, nestedKey, childIndex) {
+  const p = state.steps[parentCtx.parentIndex]; if (!p) return null;
+  const arr = Array.isArray(p[parentCtx.branchKey]) ? p[parentCtx.branchKey] : [];
+  const nestedIf = arr[parentCtx.childIndex]; if (!nestedIf) return null;
+  const branch = Array.isArray(nestedIf[nestedKey]) ? nestedIf[nestedKey] : [];
+  return branch[childIndex] || null;
+}
+
+function moveDeepNestedStep(parentCtx, nestedKey, index, delta) {
+  const p = state.steps[parentCtx.parentIndex]; if (!p) return;
+  const arr = Array.isArray(p[parentCtx.branchKey]) ? p[parentCtx.branchKey] : [];
+  const nestedIf = arr[parentCtx.childIndex]; if (!nestedIf) return;
+  const branch = Array.isArray(nestedIf[nestedKey]) ? nestedIf[nestedKey] : [];
+  const ni = index + delta; if (ni < 0 || ni >= branch.length) return;
+  const [s] = branch.splice(index, 1); branch.splice(ni, 0, s);
+  nestedIf[nestedKey] = branch; setDirty(true, { silent: true }); render();
+}
+function deleteDeepNestedStep(parentCtx, nestedKey, index) {
+  const p = state.steps[parentCtx.parentIndex]; if (!p) return;
+  const arr = Array.isArray(p[parentCtx.branchKey]) ? p[parentCtx.branchKey] : [];
+  const nestedIf = arr[parentCtx.childIndex]; if (!nestedIf) return;
+  const branch = Array.isArray(nestedIf[nestedKey]) ? nestedIf[nestedKey] : [];
+  branch.splice(index, 1); nestedIf[nestedKey] = branch; setDirty(true, { silent: true }); render();
+}
+function updateDeepNestedStepType(parentCtx, nestedKey, index, newType) {
+  const p = state.steps[parentCtx.parentIndex]; if (!p) return;
+  const arr = Array.isArray(p[parentCtx.branchKey]) ? p[parentCtx.branchKey] : [];
+  const nestedIf = arr[parentCtx.childIndex]; if (!nestedIf) return;
+  const branch = Array.isArray(nestedIf[nestedKey]) ? nestedIf[nestedKey] : [];
+  const cur = branch[index] || {};
+  const schema = STEP_LIBRARY_MAP.get(newType); if (!schema) return;
+  const next = createStepFromSchema(schema);
+  schema.fields.forEach((f) => { if (cur[f.key] !== undefined && cur[f.key] !== null) next[f.key] = cur[f.key]; });
+  next.type = newType;
+  branch[index] = next; nestedIf[nestedKey] = branch; setDirty(true, { silent: true }); render();
+}
+function updateDeepNestedFieldValue(parentCtx, nestedKey, index, field, rawValue) {
+  const p = state.steps[parentCtx.parentIndex]; if (!p) return;
+  const arr = Array.isArray(p[parentCtx.branchKey]) ? p[parentCtx.branchKey] : [];
+  const nestedIf = arr[parentCtx.childIndex]; if (!nestedIf) return;
+  const branch = Array.isArray(nestedIf[nestedKey]) ? nestedIf[nestedKey] : [];
+  if (!branch[index]) return;
+  branch[index][field.key] = rawValue;
+}
+async function runDeepNestedStep(parentCtx, nestedKey, index) {
+  if (state.pendingPicker) { alert('Finish the element picker before running a step.'); return; }
+  const st = getDeepNestedStep(parentCtx, nestedKey, index); if (!st) return;
+  const schema = STEP_LIBRARY_MAP.get(st.type); if (!schema) { alert('Unknown step type'); return; }
+  const prepared = { type: st.type };
+  for (const field of schema.fields) {
+    const value = st[field.key];
+    const isEmpty = value == null || (typeof value === 'string' && value.trim() === '');
+    if (field.required && isEmpty) { alert(`${schema.label}: ${field.label} is required.`); return; }
+    if (!isEmpty) prepared[field.key] = field.type === 'number' ? Number(value) : (typeof value === 'string' ? value.trim() : value);
+  }
+  if (prepared.type === 'Click') prepared.forceClick = Boolean(st?.forceClick);
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) { alert('No active tab found.'); return; }
+    const res = await chrome.runtime.sendMessage({ type: 'RUN_SINGLE_STEP', tabId: tab.id, step: prepared });
+    if (!res?.ok) { alert('Step failed: ' + (res?.error || 'unknown error')); return; }
+  } catch (err) {
+    console.error('[options] Deep nested step run failed:', err);
+    alert('Error running step: ' + err.message);
+  }
 }
 
 async function runNestedStep(parentIndex, branchKey, childIndex) {
@@ -1430,6 +1678,7 @@ async function persistFlow({ steps, flowName, silent } = {}) {
       flowName: prepared.flowName,
       settings: state.settings
     });
+    try { await chrome.storage.local.remove('flowUiState'); } catch {}
     state.steps = sanitizeFlowArray(prepared.steps);
     state.flowName = prepared.flowName;
     state.stepStatuses = state.steps.map(() => "idle");
@@ -1499,34 +1748,39 @@ function validateAndPrepare() {
     if (step.type === "Click" && step.forceClick !== undefined) {
       prepared.forceClick = Boolean(step.forceClick);
     }
+    // Recursively prepare If branches (supports nested If)
     if (step.type === "If") {
-      const prepBranch = (arr, which) => {
-        const out = [];
-        (Array.isArray(arr) ? arr : []).forEach((child, cidx) => {
-          const cs = STEP_LIBRARY_MAP.get(child.type);
-          if (!cs) { errors.push(`Step ${index + 1} (${which} ${cidx + 1}): Unknown type "${child.type}".`); return; }
-          const cprep = { type: child.type };
-          cs.fields.forEach((f) => {
-            const v = child[f.key];
-            const empty = v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
-            if (f.required && empty) { errors.push(`Step ${index + 1} (${which} ${cidx + 1}): ${f.label} is required.`); return; }
-            if (f.type === 'number') {
-              if (empty) return;
-              const num = Number(v);
-              if (!Number.isFinite(num)) { errors.push(`Step ${index + 1} (${which} ${cidx + 1}): ${f.label} must be a number.`); return; }
-              if (typeof f.min === 'number' && num < f.min) { errors.push(`Step ${index + 1} (${which} ${cidx + 1}): ${f.label} must be ≥ ${f.min}.`); return; }
-              cprep[f.key] = num;
-            } else if (!empty) {
-              cprep[f.key] = typeof v === 'string' ? v.trim() : v;
-            }
-          });
-          if (child.type === 'Click' && child.forceClick !== undefined) cprep.forceClick = Boolean(child.forceClick);
-          out.push(cprep);
+      const prepareChild = (child, pathLabel) => {
+        const cs = STEP_LIBRARY_MAP.get(child.type);
+        if (!cs) { errors.push(`Step ${index + 1} (${pathLabel}): Unknown type "${child.type}".`); return null; }
+        const cprep = { type: child.type };
+        cs.fields.forEach((f) => {
+          const v = child[f.key];
+          const empty = v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
+          if (f.required && empty) { errors.push(`Step ${index + 1} (${pathLabel}): ${f.label} is required.`); return; }
+          if (f.type === 'number') {
+            if (empty) return;
+            const num = Number(v);
+            if (!Number.isFinite(num)) { errors.push(`Step ${index + 1} (${pathLabel}): ${f.label} must be a number.`); return; }
+            if (typeof f.min === 'number' && num < f.min) { errors.push(`Step ${index + 1} (${pathLabel}): ${f.label} must be ≥ ${f.min}.`); return; }
+            cprep[f.key] = num;
+          } else if (!empty) {
+            cprep[f.key] = typeof v === 'string' ? v.trim() : v;
+          }
         });
-        return out;
+        if (child.type === 'Click' && child.forceClick !== undefined) cprep.forceClick = Boolean(child.forceClick);
+        if (child.type === 'If') {
+          const childThen = Array.isArray(child.then) ? child.then : [];
+          const childElse = Array.isArray(child.else) ? child.else : [];
+          cprep.then = childThen.map((g, gi) => prepareChild(g, `${pathLabel} > Then ${gi + 1}`)).filter(Boolean);
+          cprep.else = childElse.map((g, gi) => prepareChild(g, `${pathLabel} > Else ${gi + 1}`)).filter(Boolean);
+        }
+        return cprep;
       };
-      prepared.then = prepBranch(step.then, 'Then');
-      prepared.else = prepBranch(step.else, 'Else');
+      const tArr = Array.isArray(step.then) ? step.then : [];
+      const eArr = Array.isArray(step.else) ? step.else : [];
+      prepared.then = tArr.map((c, ci) => prepareChild(c, `Then ${ci + 1}`)).filter(Boolean);
+      prepared.else = eArr.map((c, ci) => prepareChild(c, `Else ${ci + 1}`)).filter(Boolean);
     }
     preparedSteps.push(prepared);
   });
@@ -1803,11 +2057,8 @@ function handleFlowStatus(msg) {
 }
 
 function handleFlowNestedStatus(msg) {
-  const p = typeof msg.parentIndex === 'number' ? msg.parentIndex : null;
-  const b = typeof msg.branch === 'string' ? msg.branch : null;
-  const c = typeof msg.childIndex === 'number' ? msg.childIndex : null;
-  if (p == null || b == null || c == null) return;
-  const key = `${p}|${b}|${c}`;
+  const key = Array.isArray(msg.path) ? msg.path.map(String).join('|') : (typeof msg.parentIndex === 'number' && typeof msg.childIndex === 'number' && typeof msg.branch === 'string' ? `${msg.parentIndex}|${msg.branch}|${msg.childIndex}` : null);
+  if (!key) return;
   let status = msg.status;
   if (!RUN_STATUS_META[status]) status = 'idle';
   state.nestedStatuses[key] = status;
@@ -1835,11 +2086,8 @@ function handleWaitCountdown(msg) {
 }
 
 function handleWaitNestedCountdown(msg) {
-  const p = typeof msg.parentIndex === 'number' ? msg.parentIndex : null;
-  const b = typeof msg.branch === 'string' ? msg.branch : null;
-  const c = typeof msg.childIndex === 'number' ? msg.childIndex : null;
-  if (p == null || b == null || c == null) return;
-  const key = `${p}|${b}|${c}`;
+  const key = Array.isArray(msg.path) ? msg.path.map(String).join('|') : (typeof msg.parentIndex === 'number' && typeof msg.childIndex === 'number' && typeof msg.branch === 'string' ? `${msg.parentIndex}|${msg.branch}|${msg.childIndex}` : null);
+  if (!key) return;
   const sec = Number(msg.seconds);
   if (!Number.isFinite(sec)) return;
   state.nestedWaitCountdowns[key] = Math.max(0, sec);
