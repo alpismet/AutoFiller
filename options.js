@@ -192,7 +192,8 @@ const state = {
   waitCountdowns: {}, /* index -> seconds */
   nestedWaitCountdowns: {} /* "parent|branch|child" -> seconds */,
   runCount: 0,
-  savedFlows: []
+  savedFlows: [],
+  lastRunIncremented: false
 };
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
@@ -293,7 +294,6 @@ function wireEvents() {
     state.ifResults = {};
     state.waitCountdowns = {};
     state.nestedWaitCountdowns = {};
-    try { chrome.storage.local.remove('flowUiState'); } catch {}
     render();
     setDirty(true);
     showStatus("Loaded default flow. Save to persist.");
@@ -310,7 +310,6 @@ function wireEvents() {
       const text = await file.text();
       const payload = JSON.parse(text);
       applyImportedFlow(payload);
-      try { await chrome.storage.local.remove('flowUiState'); } catch {}
       render();
       setDirty(true);
       showStatus("Imported flow. Save to persist.");
@@ -331,7 +330,10 @@ function wireEvents() {
     }
     const prepared = validateAndPrepare(); if (!prepared) return;
     await persistFlow({ steps: prepared.steps, flowName: prepared.flowName, silent: true });
-    state.runCount = 0; state.isRunning = true; updateRunButton(); render();
+    // Reset runs counter when starting a new run
+    state.runCount = 0;
+    try { await chrome.storage.local.set({ runCountTotal: 0 }); } catch {}
+    state.isRunning = true; updateRunButton(); render();
     const ok = await triggerRunFlow();
     if (ok) { showStatus("Flow dispatched to active tab."); } else { state.isRunning = false; updateRunButton(); }
   });
@@ -431,7 +433,7 @@ function wireEvents() {
 
 async function loadFromStorage() {
   try {
-    const { activeFlow, flowName, settings, flowUiState, savedFlows } = await chrome.storage.local.get(["activeFlow", "flowName", "settings", "flowUiState", "savedFlows"]);
+    const { activeFlow, flowName, settings, flowUiState, savedFlows, runCountTotal } = await chrome.storage.local.get(["activeFlow", "flowName", "settings", "flowUiState", "savedFlows", "runCountTotal"]);
     const sanitized = sanitizeFlowArray(activeFlow);
     state.steps = sanitized.length ? sanitized : cloneFlow(DEFAULT_FLOW);
     state.flowName = typeof flowName === "string" && flowName.trim() ? flowName : DEFAULT_FLOW_NAME;
@@ -445,7 +447,7 @@ async function loadFromStorage() {
     state.ifResults = typeof ui.ifResults === 'object' && ui.ifResults ? ui.ifResults : {};
     state.waitCountdowns = typeof ui.waitCountdowns === 'object' && ui.waitCountdowns ? ui.waitCountdowns : {};
     state.nestedWaitCountdowns = typeof ui.nestedWaitCountdowns === 'object' && ui.nestedWaitCountdowns ? ui.nestedWaitCountdowns : {};
-    state.runCount = Number(ui.iterCount) || 0;
+    state.runCount = Number(runCountTotal) || Number(ui.iterCount) || 0;
     state.savedFlows = Array.isArray(savedFlows) ? savedFlows : [];
     snapshotAsSaved();
     setDirty(false, { silent: true });
@@ -1797,7 +1799,6 @@ async function persistFlow({ steps, flowName, silent } = {}) {
       flowName: prepared.flowName,
       settings: state.settings
     });
-    try { await chrome.storage.local.remove('flowUiState'); } catch {}
     state.steps = sanitizeFlowArray(prepared.steps);
     state.flowName = prepared.flowName;
     state.stepStatuses = state.steps.map(() => "idle");
@@ -2317,6 +2318,7 @@ function handleFlowStatus(msg) {
     state.waitCountdowns = {};
     state.nestedWaitCountdowns = {};
     state.isRunning = true;
+    state.lastRunIncremented = false;
     updateRunButton();
     render();
     return;
@@ -2332,6 +2334,12 @@ function handleFlowStatus(msg) {
     }
     // update running state: if any step pending/running -> running; else -> stopped
     const anyActive = state.stepStatuses.some(s => s === 'pending' || s === 'running');
+    // If final step just marked success and nothing active, ensure counter increments once
+    const isFinalSuccess = (idx === state.steps.length - 1) && (status === 'success') && !anyActive;
+    if (isFinalSuccess && !state.lastRunIncremented) {
+      state.runCount = (Number(state.runCount) || 0) + 1;
+      state.lastRunIncremented = true;
+    }
     state.isRunning = anyActive;
     updateRunButton();
     render();
@@ -2377,11 +2385,9 @@ function handleWaitNestedCountdown(msg) {
 }
 
 function handleFlowIter(msg) {
-  const n = Number(msg.count);
-  if (Number.isFinite(n)) {
-    state.runCount = n;
-    render();
-  }
+  state.runCount = (Number(state.runCount) || 0) + 1;
+  state.lastRunIncremented = true;
+  render();
 }
 
 // ---- utils for SelectFiles field ----
