@@ -159,12 +159,67 @@
       gap: 12px;
       margin-bottom: 16px;
     }
+    .branch-list:empty {
+      margin-bottom: 0;
+      padding: 0;
+      min-height: 0;
+    }
+    .dragging-active .branch-list:empty,
+    .dragging-active #stepsContainer:empty {
+      min-height: 48px;
+      border-radius: 12px;
+      border: 2px dashed rgba(37,99,235,0.35);
+      background: rgba(37,99,235,0.08);
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .dragging-active .branch-list:empty::before,
+    .dragging-active #stepsContainer:empty::before {
+      content: "Drop here";
+    }
     .step-card {
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 16px;
       box-shadow: var(--shadow);
+      transition: transform 0.18s ease, box-shadow 0.18s ease;
+    }
+    .step-card.dragging {
+      opacity: 0.35;
+      transform: scale(0.96);
+      box-shadow: 0 20px 45px rgba(15, 23, 42, 0.35);
+    }
+    .dragging-active .step-card:not(.dragging) {
+      transform-origin: center;
+    }
+    .step-card.drop-hover {
+      transform: translateY(2px);
+      box-shadow: 0 12px 22px rgba(37, 99, 235, 0.18);
+    }
+    .drop-target-highlight {
+      outline: 2px solid var(--accent);
+      outline-offset: 4px;
+      border-radius: 12px;
+      box-shadow: 0 0 0 6px rgba(37,99,235,0.08);
+    }
+    .drop-denied-highlight {
+      outline: 2px solid var(--danger);
+      outline-offset: 4px;
+      border-radius: 12px;
+      box-shadow: 0 0 0 6px rgba(220,38,38,0.12);
+    }
+    .drop-indicator {
+      height: 4px;
+      border-radius: 999px;
+      margin: 4px 0;
+      background: linear-gradient(90deg, rgba(37,99,235,0.1) 0%, var(--accent) 40%, var(--accent) 60%, rgba(37,99,235,0.1) 100%);
+      box-shadow: 0 4px 12px rgba(37,99,235,0.25);
+      pointer-events: none;
     }
     .step-header {
       display: flex;

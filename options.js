@@ -199,6 +199,35 @@ const state = {
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
 
+// Modern drag & drop state (supports nested If branches)
+const DND_MIME = "application/x-autofiller-step";
+const dndState = {
+  active: false,
+  srcPath: null,
+  srcCtx: null,
+  dragCard: null,
+  indicator: (() => {
+    const el = document.createElement('div');
+    el.className = 'drop-indicator';
+    return el;
+  })(),
+  targetList: null,
+  targetCtx: null,
+  targetIndex: -1,
+  targetValid: false
+};
+let dndHandlersBound = false;
+
+function markListDroppable(listEl, hostPath = [], branch = 'root') {
+  if (!listEl) return;
+  try {
+    listEl.dataset.hostPath = JSON.stringify(hostPath || []);
+  } catch {
+    listEl.dataset.hostPath = '[]';
+  }
+  listEl.dataset.branch = branch;
+}
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || !msg.type) return;
   if (msg.type === "PICKER_RESULT") {
@@ -248,6 +277,7 @@ init().catch((err) => {
 
 async function init() {
   wireEvents();
+  setupGlobalDnDHandlers();
   window.addEventListener("beforeunload", () => {
     if (state.pendingPicker) {
       try {
@@ -523,6 +553,7 @@ function renderSteps() {
   const container = els.stepsContainer;
   if (!container) return;
   container.innerHTML = "";
+  markListDroppable(container, [], 'root');
 
   state.steps.forEach((step, index) => {
     const card = createStepCard(step, index);
@@ -600,6 +631,7 @@ function createStepCard(step, index) {
     renderIfBranches(fieldsContainer, step, index);
   }
 
+  setupStepCardDnD(card, [index]);
   return card;
 }
 
@@ -1080,7 +1112,8 @@ function renderIfBranches(container, step, stepIndex) {
     section.appendChild(label);
 
     const list = document.createElement("div");
-    list.className = "flows";
+    list.className = "flows branch-list";
+    markListDroppable(list, [stepIndex], key);
     section.appendChild(list);
 
     const actions = document.createElement("div");
@@ -1177,6 +1210,7 @@ function createNestedStepCard(parentIndex, branchKey, childIndex, step, branchLa
   });
 
   buildFieldsNested(fieldsContainer, schema, step, { parentIndex, branchKey, childIndex, path: [parentIndex, branchKey, childIndex] });
+  setupStepCardDnD(card, [parentIndex, branchKey, childIndex]);
   return card;
 }
 
@@ -1371,7 +1405,10 @@ function renderIfBranchesDeep(container, ctx) {
     const section = document.createElement('div');
     section.className = 'field';
     const label = document.createElement('label'); label.textContent = labelText; section.appendChild(label);
-    const list = document.createElement('div'); list.className = 'flows'; section.appendChild(list);
+    const list = document.createElement('div'); list.className = 'flows branch-list';
+    const hostPath = Array.isArray(ctx.path) ? ctx.path.slice() : [ctx.parentIndex, ctx.branchKey, ctx.childIndex];
+    markListDroppable(list, hostPath, key);
+    section.appendChild(list);
     const actions = document.createElement('div'); actions.style.display = 'flex'; actions.style.gap = '8px';
     const add = document.createElement('button'); add.type = 'button'; add.textContent = '＋ Add Step'; add.className = 'wide-add';
     add.addEventListener('click', () => {
@@ -1465,6 +1502,9 @@ function createDeepNestedStepCard(parentCtx, nestedKey, childIndex, step, branch
   });
 
   buildFieldsDeep(fieldsContainer, schema, step, parentCtx, nestedKey, childIndex);
+  const basePath = Array.isArray(parentCtx.path) ? parentCtx.path.slice() : [parentCtx.parentIndex, parentCtx.branchKey, parentCtx.childIndex];
+  const path = [...basePath, nestedKey, childIndex];
+  setupStepCardDnD(card, path);
   return card;
 }
 
@@ -1745,6 +1785,359 @@ function updateEmptyState() {
   } else {
     els.emptyState.classList.add("hidden");
   }
+}
+
+// =============== Drag & Drop ===============
+function setupStepCardDnD(card, path) {
+  if (!card) return;
+  card.draggable = true;
+  card.dataset.path = JSON.stringify(path);
+  card.addEventListener('dragstart', onCardDragStart);
+  card.addEventListener('dragend', onCardDragEnd);
+}
+
+function setupGlobalDnDHandlers() {
+  if (dndHandlersBound) return;
+  document.addEventListener('dragover', onDocumentDragOver, true);
+  document.addEventListener('drop', onDocumentDrop, true);
+  window.addEventListener('blur', resetDndState, true);
+  dndHandlersBound = true;
+}
+
+function onCardDragStart(event) {
+  if (state.pendingPicker) {
+    event.preventDefault();
+    return;
+  }
+  const card = event.currentTarget;
+  const path = parsePath(card?.dataset?.path);
+  if (!Array.isArray(path)) {
+    event.preventDefault();
+    return;
+  }
+  const srcCtx = getContainerContextForPath(path);
+  if (!srcCtx) {
+    event.preventDefault();
+    return;
+  }
+  dndState.active = true;
+  dndState.srcPath = path.slice();
+  dndState.srcCtx = srcCtx;
+  dndState.dragCard = card;
+  dndState.targetList = null;
+  dndState.targetCtx = null;
+  dndState.targetIndex = -1;
+  dndState.targetValid = false;
+  card.classList.add('dragging');
+  document.body.classList.add('dragging-active');
+  try {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData(DND_MIME, JSON.stringify(path));
+    event.dataTransfer.setData('text/plain', 'drag');
+  } catch {}
+}
+
+function onCardDragEnd() {
+  resetDndState();
+}
+
+function onDocumentDragOver(event) {
+  if (!dndState.active) return;
+  const listEl = findListElement(event.target);
+  if (!listEl) {
+    clearCurrentDropTarget();
+    try { event.dataTransfer.dropEffect = 'none'; } catch {}
+    return;
+  }
+  const ctx = getContextFromList(listEl);
+  if (!ctx) {
+    clearCurrentDropTarget();
+    return;
+  }
+  const invalid = isDropIntoOwnSubtree(dndState.srcPath, ctx);
+  if (invalid) {
+    event.preventDefault();
+    setCurrentDropTarget(listEl, ctx, -1, false);
+    try { event.dataTransfer.dropEffect = 'none'; } catch {}
+    return;
+  }
+  event.preventDefault();
+  try { event.dataTransfer.dropEffect = 'move'; } catch {}
+  const index = computeDropIndex(listEl, event.clientY);
+  setCurrentDropTarget(listEl, ctx, index, true);
+}
+
+function onDocumentDrop(event) {
+  if (!dndState.active) return;
+  event.preventDefault();
+  const srcPath = dndState.srcPath ? dndState.srcPath.slice() : null;
+  const targetCtx = dndState.targetValid ? dndState.targetCtx : null;
+  let targetIndex = dndState.targetValid ? dndState.targetIndex : -1;
+  // determine index from event target if we lost it
+  if (targetCtx && targetIndex < 0) {
+    const listEl = findListElement(event.target) || dndState.targetList;
+    if (listEl) targetIndex = computeDropIndex(listEl, event.clientY);
+  }
+  resetDndState();
+  if (!srcPath || !targetCtx) return;
+  const changed = applyMoveStep(srcPath, targetCtx, targetIndex);
+  render();
+  if (changed) setDirty(true, { silent: true });
+}
+
+function resetDndState() {
+  if (!dndState.active) return;
+  if (dndState.dragCard) dndState.dragCard.classList.remove('dragging');
+  clearCurrentDropTarget();
+  removeDropIndicator();
+  dndState.active = false;
+  dndState.srcPath = null;
+  dndState.srcCtx = null;
+  dndState.dragCard = null;
+  dndState.targetList = null;
+  dndState.targetCtx = null;
+  dndState.targetIndex = -1;
+  dndState.targetValid = false;
+  document.body.classList.remove('dragging-active');
+}
+
+function clearCurrentDropTarget() {
+  if (dndState.targetList) {
+    dndState.targetList.classList.remove('drop-target-highlight', 'drop-denied-highlight');
+  }
+  if (dndState.targetList) {
+    Array.from(dndState.targetList.children).forEach((child) => child.classList?.remove('drop-hover'));
+  }
+  dndState.targetList = null;
+  dndState.targetCtx = null;
+  dndState.targetIndex = -1;
+  dndState.targetValid = false;
+}
+
+function setCurrentDropTarget(listEl, ctx, index, valid) {
+  if (dndState.targetList && dndState.targetList !== listEl) {
+    dndState.targetList.classList.remove('drop-target-highlight', 'drop-denied-highlight');
+    Array.from(dndState.targetList.children).forEach((child) => child.classList?.remove('drop-hover'));
+  }
+  if (!valid) {
+    listEl.classList.remove('drop-target-highlight');
+    listEl.classList.add('drop-denied-highlight');
+    removeDropIndicator();
+    Array.from(listEl.children).forEach((child) => child.classList?.remove('drop-hover'));
+    dndState.targetList = listEl;
+    dndState.targetCtx = null;
+    dndState.targetIndex = -1;
+    dndState.targetValid = false;
+    return;
+  }
+  listEl.classList.remove('drop-denied-highlight');
+  listEl.classList.add('drop-target-highlight');
+  positionDropIndicator(listEl, index);
+  highlightHoverCards(listEl, index);
+  dndState.targetList = listEl;
+  dndState.targetCtx = ctx;
+  dndState.targetIndex = index;
+  dndState.targetValid = true;
+}
+
+function positionDropIndicator(listEl, index) {
+  const indicator = dndState.indicator;
+  const cards = getChildCards(listEl, true);
+  if (index <= 0) {
+    listEl.insertBefore(indicator, cards[0] || null);
+  } else if (index >= cards.length) {
+    listEl.appendChild(indicator);
+  } else {
+    listEl.insertBefore(indicator, cards[index]);
+  }
+}
+
+function removeDropIndicator() {
+  const indicator = dndState.indicator;
+  if (indicator && indicator.parentElement) {
+    indicator.parentElement.removeChild(indicator);
+  }
+}
+
+function highlightHoverCards(listEl, index) {
+  const cards = getChildCards(listEl, true);
+  cards.forEach((card, idx) => {
+    if (idx === index || idx === index - 1) card.classList.add('drop-hover');
+    else card.classList.remove('drop-hover');
+  });
+}
+
+function computeDropIndex(listEl, clientY) {
+  const cards = getChildCards(listEl, true);
+  if (cards.length === 0) return 0;
+  for (let i = 0; i < cards.length; i++) {
+    const rect = cards[i].getBoundingClientRect();
+    const midpoint = rect.top + rect.height / 2;
+    if (clientY < midpoint) return i;
+  }
+  return cards.length;
+}
+
+function getChildCards(listEl, excludeDragging = false) {
+  return Array.from(listEl.children).filter((child) => {
+    if (!child.classList || !child.classList.contains('step-card')) return false;
+    if (excludeDragging && child === dndState.dragCard) return false;
+    return true;
+  });
+}
+
+function findListElement(target) {
+  let el = target instanceof Element ? target : null;
+  while (el && !el.classList.contains('flows')) {
+    el = el.parentElement;
+  }
+  return el;
+}
+
+function getContextFromList(listEl) {
+  if (!listEl) return null;
+  const branch = listEl.dataset?.branch;
+  const hostPath = parsePath(listEl.dataset?.hostPath);
+  if (branch === 'root') return { type: 'root' };
+  if (branch === 'then' || branch === 'else') {
+    return { type: 'branch', hostPath, branch };
+  }
+  return null;
+}
+
+function parsePath(raw) {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function isDropIntoOwnSubtree(srcPath, targetCtx) {
+  if (!Array.isArray(srcPath) || !targetCtx) return true;
+  if (targetCtx.type !== 'branch') return false;
+  const host = Array.isArray(targetCtx.hostPath) ? targetCtx.hostPath : [];
+  if (host.length < srcPath.length) return false;
+  for (let i = 0; i < srcPath.length; i++) {
+    if (host[i] !== srcPath[i]) return false;
+  }
+  return true;
+}
+
+function getContainerContextForPath(path) {
+  if (!Array.isArray(path) || path.length === 0) return { type: 'root' };
+  if (path.length === 1) return { type: 'root' };
+  const branch = path[path.length - 2];
+  const hostPath = path.slice(0, -2);
+  return { type: 'branch', hostPath, branch };
+}
+
+function getParentContainerForPath(path) {
+  if (!Array.isArray(path) || path.length === 0) return null;
+  if (path.length === 1) {
+    return { array: state.steps, index: path[0], ctx: { type: 'root' } };
+  }
+  if (path.length < 3) return null;
+  const branch = path[path.length - 2];
+  const idx = path[path.length - 1];
+  const hostPath = path.slice(0, -2);
+  const hostStep = resolveStepByPath(hostPath);
+  if (!hostStep) return null;
+  const arr = Array.isArray(hostStep[branch]) ? hostStep[branch] : null;
+  if (!arr) return null;
+  return { array: arr, index: idx, ctx: { type: 'branch', hostPath, branch } };
+}
+
+function resolveStepByPath(path) {
+  if (!Array.isArray(path) || path.length === 0) return null;
+  let current = state.steps;
+  let step = null;
+  let i = 0;
+  while (i < path.length) {
+    const index = path[i];
+    if (typeof index !== 'number' || !current) return null;
+    step = current[index];
+    if (!step) return null;
+    i += 1;
+    if (i >= path.length) return step;
+    const branch = path[i];
+    if (branch !== 'then' && branch !== 'else') return null;
+    current = Array.isArray(step[branch]) ? step[branch] : null;
+    i += 1;
+  }
+  return step;
+}
+
+function getArrayForContext(ctx) {
+  if (!ctx || ctx.type === 'root') return state.steps;
+  const hostStep = resolveStepByPath(ctx.hostPath);
+  if (!hostStep) return null;
+  const branch = ctx.branch === 'else' ? 'else' : 'then';
+  if (!Array.isArray(hostStep[branch])) hostStep[branch] = [];
+  return hostStep[branch];
+}
+
+function removeStepAtPath(path) {
+  const parent = getParentContainerForPath(path);
+  if (!parent) return null;
+  const { array, index, ctx } = parent;
+  if (index < 0 || index >= array.length) return null;
+  const [step] = array.splice(index, 1);
+  let removedStatus = 'idle';
+  if (ctx.type === 'root') {
+    const [status] = state.stepStatuses.splice(index, 1);
+    removedStatus = status || 'idle';
+  }
+  return { step, status: removedStatus, ctx, index };
+}
+
+function insertStepIntoContext(step, targetCtx, index, status = 'idle') {
+  const array = getArrayForContext(targetCtx);
+  if (!array) return;
+  const insertAt = Math.max(0, Math.min(index, array.length));
+  array.splice(insertAt, 0, step);
+  if (targetCtx.type === 'root') {
+    state.stepStatuses.splice(insertAt, 0, status || 'idle');
+  }
+}
+
+function contextsMatch(a, b) {
+  if (!a || !b) return false;
+  if (a.type !== b.type) return false;
+  if (a.type === 'root') return true;
+  if (a.branch !== b.branch) return false;
+  const ap = Array.isArray(a.hostPath) ? a.hostPath : [];
+  const bp = Array.isArray(b.hostPath) ? b.hostPath : [];
+  if (ap.length !== bp.length) return false;
+  for (let i = 0; i < ap.length; i++) {
+    if (ap[i] !== bp[i]) return false;
+  }
+  return true;
+}
+
+function resetFlowStatuses() {
+  state.stepStatuses = state.steps.map(() => 'idle');
+  state.nestedStatuses = {};
+  state.ifResults = {};
+  state.waitCountdowns = {};
+  state.nestedWaitCountdowns = {};
+}
+
+function applyMoveStep(srcPath, targetCtx, rawIndex) {
+  if (!Array.isArray(srcPath) || !targetCtx) return false;
+  const removal = removeStepAtPath(srcPath);
+  if (!removal) return false;
+  const { step, status, ctx: srcCtx, index: originalIndex } = removal;
+  let insertIndex = Number.isInteger(rawIndex) ? rawIndex : 0;
+  insertIndex = Math.max(0, insertIndex);
+  const sameContainer = contextsMatch(srcCtx, targetCtx);
+  insertStepIntoContext(step, targetCtx, insertIndex, status);
+  const noChange = sameContainer && originalIndex === insertIndex;
+  if (!noChange) {
+    resetFlowStatuses();
+  }
+  return !noChange;
 }
 
 function setControlsDisabled(disabled) {
