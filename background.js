@@ -419,6 +419,10 @@ async function runFlow(flow, tabId) {
 
   // notify options to reset statuses
   broadcastToOptions({ type: "FLOW_STATUS", kind: "FLOW_RESET" });
+  // iteration counter
+  let iterCount = 0;
+  try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
+  let aborted = false;
 
   for (let i = 0; i < flow.length; i++) {
     const step = flow[i];
@@ -451,6 +455,7 @@ async function runFlow(flow, tabId) {
         if (step._remaining === Infinity || step._remaining > 0) {
           if (step._remaining !== Infinity) step._remaining -= 1;
           // reset statuses and restart from the beginning
+          iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
           broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
           i = -1; // next loop starts at 0
         }
@@ -463,6 +468,7 @@ async function runFlow(flow, tabId) {
         if (Array.isArray(branch) && branch.length) {
           const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else', path: [i, (cond ? 'then' : 'else')] });
           if (outcome && outcome.restartRequested) {
+            iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
             broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
             i = -1; // restart
           }
@@ -482,10 +488,14 @@ async function runFlow(flow, tabId) {
       console.warn("[background] Step failed:", err);
       broadcastToOptions({ type: "FLOW_STATUS", index: i, status: "error", error: String(err) });
       // stop on error or continue? For now, stop
+      aborted = true;
       break;
     }
     const delay = Math.max(0, Number(settings.stepDelayMs) || 0);
     if (delay) await wait(delay);
+  }
+  if (!aborted) {
+    iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
   }
 }
 
@@ -660,13 +670,13 @@ async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } 
     if (subject && subject.trim()) parts.push(`subject:(${subject.trim()})`);
     if (mode === 'after' && afterSeconds) parts.push(`after:${afterSeconds}`);
     if (mode === 'newer') parts.push(`newer_than:${minutes}m`);
-    if (includeInbox) parts.push(`in:inbox`);
+    if (includeInbox) parts.push(`in:inbox`); else parts.push(`in:anywhere`);
     return parts.join(" ");
   };
 
   const SKEW_MS = 2000; // allow up to 2s negative skew for provider clock differences
   async function fetchByQuery(q) {
-    const listUrl = `${base}/messages?q=${encodeURIComponent(q)}&maxResults=5`;
+    const listUrl = `${base}/messages?q=${encodeURIComponent(q)}&maxResults=5&includeSpamTrash=true`;
     const list = await fetch(listUrl, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json());
     const items = Array.isArray(list?.messages) ? list.messages : [];
     if (!items.length) return [];
@@ -690,8 +700,8 @@ async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } 
     return skew;
   }
 
-  // Try high-precision search first with after:SECONDS
-  for (const includeInbox of [true, false]) {
+  // Try high-precision search first with after:SECONDS, prioritizing anywhere (includes trash/spam)
+  for (const includeInbox of [false, true]) {
     const qAfter = buildQuery(includeInbox, 'after');
     const res = await fetchByQuery(qAfter);
     if (res.length) {
@@ -700,7 +710,7 @@ async function gmailFetchLatestByQuery(token, { subject = "", newerThanMs = 0 } 
     }
   }
   // Fallback to minute-based
-  for (const includeInbox of [true, false]) {
+  for (const includeInbox of [false, true]) {
     const qNewer = buildQuery(includeInbox, 'newer');
     const res = await fetchByQuery(qNewer);
     if (res.length) {
@@ -953,6 +963,8 @@ async function mirrorUiStateToStorage(payload) {
         map[key] = Math.max(0, Number(payload.seconds) || 0);
         ui.nestedWaitCountdowns = map;
       }
+    } else if (payload?.type === 'FLOW_ITER') {
+      ui.iterCount = Number(payload.count) || 0;
     }
     await chrome.storage.local.set({ [key]: ui });
   } catch (err) {

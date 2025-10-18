@@ -141,6 +141,7 @@ const els = {
   importFlow: document.getElementById("importFlow"),
   runFlow: document.getElementById("runFlow"),
   stopFlow: document.getElementById("stopFlow"),
+  runCounter: document.getElementById("runCounter"),
   status: document.getElementById("status"),
   stepTemplate: document.getElementById("step-template"),
   flowName: document.getElementById("flowName"),
@@ -171,7 +172,8 @@ const state = {
   nestedStatuses: {}, /* key "parentIndex|branch|childIndex" -> status */
   ifResults: {}, /* index -> 'then'|'else' */
   waitCountdowns: {}, /* index -> seconds */
-  nestedWaitCountdowns: {} /* "parent|branch|child" -> seconds */
+  nestedWaitCountdowns: {} /* "parent|branch|child" -> seconds */,
+  runCount: 0
 };
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
@@ -194,12 +196,20 @@ chrome.runtime.onMessage.addListener((msg) => {
     handleIfResult(msg);
     return;
   }
+  if (msg.type === "FLOW_ITER") {
+    handleFlowIter(msg);
+    return;
+  }
   if (msg.type === "WAIT_COUNTDOWN") {
     handleWaitCountdown(msg);
     return;
   }
   if (msg.type === "WAIT_NESTED_COUNTDOWN") {
     handleWaitNestedCountdown(msg);
+    return;
+  }
+  if (msg.type === "FLOW_ITER") {
+    handleFlowIter(msg);
     return;
   }
 });
@@ -288,6 +298,7 @@ function wireEvents() {
     const prepared = validateAndPrepare();
     if (!prepared) return;
     await persistFlow({ steps: prepared.steps, flowName: prepared.flowName, silent: true });
+    state.runCount = 0; render();
     const ok = await triggerRunFlow();
     if (ok) {
       showStatus("Flow dispatched to active tab.");
@@ -390,6 +401,7 @@ async function loadFromStorage() {
     state.ifResults = typeof ui.ifResults === 'object' && ui.ifResults ? ui.ifResults : {};
     state.waitCountdowns = typeof ui.waitCountdowns === 'object' && ui.waitCountdowns ? ui.waitCountdowns : {};
     state.nestedWaitCountdowns = typeof ui.nestedWaitCountdowns === 'object' && ui.nestedWaitCountdowns ? ui.nestedWaitCountdowns : {};
+    state.runCount = Number(ui.iterCount) || 0;
     snapshotAsSaved();
     setDirty(false, { silent: true });
   } catch (err) {
@@ -402,6 +414,7 @@ async function loadFromStorage() {
     state.ifResults = {};
     state.waitCountdowns = {};
     state.nestedWaitCountdowns = {};
+    state.runCount = 0;
     snapshotAsSaved();
     setDirty(false, { silent: true });
   }
@@ -410,6 +423,7 @@ async function loadFromStorage() {
 function render() {
   renderSteps();
   els.flowName.value = state.flowName;
+  if (els.runCounter) els.runCounter.textContent = `Runs: ${state.runCount || 0}`;
   // settings reflect
   if (els.stepDelayMs) els.stepDelayMs.value = String(state.settings.stepDelayMs ?? DEFAULT_SETTINGS.stepDelayMs);
   if (els.selectorWaitMs) els.selectorWaitMs.value = String(state.settings.selectorWaitMs ?? DEFAULT_SETTINGS.selectorWaitMs);
@@ -1251,10 +1265,14 @@ function buildFieldsNested(container, schema, step, ctx) {
 
 function renderIfBranchesDeep(container, ctx) {
   const stepRef = () => {
+    if (Array.isArray(ctx.path)) {
+      const s = getStepAtPath(ctx.path);
+      return s || null;
+    }
     const p = state.steps[ctx.parentIndex];
     if (!p) return null;
     const arr = Array.isArray(p[ctx.branchKey]) ? p[ctx.branchKey] : [];
-    return arr[ctx.childIndex] || null; // this is the nested If step
+    return arr[ctx.childIndex] || null; // fallback: direct nested If
   };
 
   const makeBranch = (key, labelText) => {
@@ -1288,6 +1306,23 @@ function renderIfBranchesDeep(container, ctx) {
 
   container.appendChild(makeBranch('then', 'Then'));
   container.appendChild(makeBranch('else', 'Else'));
+}
+
+function getStepAtPath(path) {
+  try {
+    if (!Array.isArray(path) || path.length < 3) return null;
+    const top = Number(path[0]);
+    let cur = state.steps[top];
+    for (let i = 1; i < path.length; i += 2) {
+      const key = path[i];
+      const idx = path[i + 1];
+      if (!cur || (key !== 'then' && key !== 'else')) return null;
+      const arr = Array.isArray(cur[key]) ? cur[key] : [];
+      cur = arr[idx];
+      if (!cur) return null;
+    }
+    return cur;
+  } catch { return null; }
 }
 
 function createDeepNestedStepCard(parentCtx, nestedKey, childIndex, step, branchLabel) {
@@ -2092,6 +2127,14 @@ function handleWaitNestedCountdown(msg) {
   if (!Number.isFinite(sec)) return;
   state.nestedWaitCountdowns[key] = Math.max(0, sec);
   render();
+}
+
+function handleFlowIter(msg) {
+  const n = Number(msg.count);
+  if (Number.isFinite(n)) {
+    state.runCount = n;
+    render();
+  }
 }
 
 // ---- utils for SelectFiles field ----
