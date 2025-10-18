@@ -54,9 +54,14 @@ const STEP_LIBRARY = [
   },
   {
     type: "Restart",
-    label: "Restart flow",
-    description: "Restart execution from the first step. Prevent loops with Max restarts.",
+    label: "Restart",
+    description: "Jump execution to Flow start or a specific If step.",
     fields: [
+      { key: "mode", label: "Target", type: "select", required: true, options: [
+        { value: "flow", label: "Flow start" },
+        { value: "if", label: "If step" }
+      ], default: "flow" },
+      { key: "ifIndex", label: "If step", type: "select" },
       { key: "max", label: "Max restarts (-1 = infinite)", type: "number", min: -1, step: 1, default: 1 }
     ]
   },
@@ -140,7 +145,7 @@ const els = {
   exportFlow: document.getElementById("exportFlow"),
   importFlow: document.getElementById("importFlow"),
   runFlow: document.getElementById("runFlow"),
-  stopFlow: document.getElementById("stopFlow"),
+  // stopFlow removed; runFlow toggles
   runCounter: document.getElementById("runCounter"),
   status: document.getElementById("status"),
   stepTemplate: document.getElementById("step-template"),
@@ -148,8 +153,11 @@ const els = {
   // tabs
   tabFlowBtn: document.getElementById("tabFlowBtn"),
   tabSettingsBtn: document.getElementById("tabSettingsBtn"),
+  tabLibraryBtn: document.getElementById("tabLibraryBtn"),
+  tabsNav: document.getElementById("tabsNav"),
   tabFlow: document.getElementById("tab-flow"),
   tabSettings: document.getElementById("tab-settings"),
+  tabLibrary: document.getElementById("tab-library"),
   // settings controls
   stepDelayMs: document.getElementById("stepDelayMs"),
   selectorWaitMs: document.getElementById("selectorWaitMs"),
@@ -157,7 +165,17 @@ const els = {
   gmailClientId: document.getElementById("gmailClientId"),
   connectGmailBtn: document.getElementById("connectGmailBtn"),
   testWaitForEmailGmailBtn: document.getElementById("testWaitForEmailGmailBtn"),
-  gmailStatus: document.getElementById("gmailStatus")
+  gmailStatus: document.getElementById("gmailStatus"),
+  // library controls
+  saveAsNewBtn: document.getElementById("saveAsNewBtn"),
+  savedFlowsContainer: document.getElementById("savedFlowsContainer"),
+  savedEmptyState: document.getElementById("savedEmptyState"),
+  // menu
+  moreMenuBtn: document.getElementById("moreMenuBtn"),
+  moreMenu: document.getElementById("moreMenu"),
+  menuReset: document.getElementById("menuReset"),
+  menuExport: document.getElementById("menuExport"),
+  menuImport: document.getElementById("menuImport")
 };
 
 const state = {
@@ -173,7 +191,8 @@ const state = {
   ifResults: {}, /* index -> 'then'|'else' */
   waitCountdowns: {}, /* index -> seconds */
   nestedWaitCountdowns: {} /* "parent|branch|child" -> seconds */,
-  runCount: 0
+  runCount: 0,
+  savedFlows: []
 };
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
@@ -208,6 +227,11 @@ chrome.runtime.onMessage.addListener((msg) => {
     handleWaitNestedCountdown(msg);
     return;
   }
+  if (msg.type === "FLOW_ABORT") {
+    state.isRunning = false;
+    updateRunButton();
+    return;
+  }
   if (msg.type === "FLOW_ITER") {
     handleFlowIter(msg);
     return;
@@ -233,6 +257,10 @@ async function init() {
     }
   });
   await loadFromStorage();
+  try {
+    const q = await chrome.runtime.sendMessage({ type: 'QUERY_FLOW_STATE' });
+    if (q && q.ok) { state.isRunning = Boolean(q.running); updateRunButton(); }
+  } catch {}
   initTabs();
   render();
 }
@@ -295,24 +323,34 @@ function wireEvents() {
   });
 
   els.runFlow?.addEventListener("click", async () => {
-    const prepared = validateAndPrepare();
-    if (!prepared) return;
-    await persistFlow({ steps: prepared.steps, flowName: prepared.flowName, silent: true });
-    state.runCount = 0; render();
-    const ok = await triggerRunFlow();
-    if (ok) {
-      showStatus("Flow dispatched to active tab.");
+    if (state.isRunning) {
+      try { await chrome.runtime.sendMessage({ type: "STOP_FLOW" }); showStatus("Stop requested."); } catch {}
+      // reflect immediately
+      state.isRunning = false; updateRunButton();
+      return;
     }
+    const prepared = validateAndPrepare(); if (!prepared) return;
+    await persistFlow({ steps: prepared.steps, flowName: prepared.flowName, silent: true });
+    state.runCount = 0; state.isRunning = true; updateRunButton(); render();
+    const ok = await triggerRunFlow();
+    if (ok) { showStatus("Flow dispatched to active tab."); } else { state.isRunning = false; updateRunButton(); }
   });
 
-  els.stopFlow?.addEventListener("click", async () => {
-    try {
-      await chrome.runtime.sendMessage({ type: "STOP_FLOW" });
-      showStatus("Stop requested.");
-    } catch (err) {
-      console.warn("[options] Stop flow error:", err);
-    }
+  // menu events
+  els.moreMenuBtn?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    els.moreMenu?.classList.toggle("hidden");
   });
+  document.addEventListener("click", (e) => {
+    if (!els.moreMenu || els.moreMenu.classList.contains("hidden")) return;
+    const inside = e.target === els.moreMenu || els.moreMenu.contains(e.target) || e.target === els.moreMenuBtn;
+    if (!inside) els.moreMenu.classList.add("hidden");
+  });
+  els.menuReset?.addEventListener("click", () => { els.moreMenu?.classList.add("hidden"); els.loadDefault?.click(); });
+  els.menuExport?.addEventListener("click", () => { els.moreMenu?.classList.add("hidden"); exportFlow(); });
+  els.menuImport?.addEventListener("click", () => { els.moreMenu?.classList.add("hidden"); els.importFlow?.click(); });
+
+  // removed duplicate message listener; handled centrally
 
   els.flowName?.addEventListener("input", (event) => {
     state.flowName = event.target.value;
@@ -322,6 +360,7 @@ function wireEvents() {
   // tabs
   els.tabFlowBtn?.addEventListener("click", () => selectTab("flow"));
   els.tabSettingsBtn?.addEventListener("click", () => selectTab("settings"));
+  els.tabLibraryBtn?.addEventListener("click", () => selectTab("library"));
 
   // settings inputs
   els.stepDelayMs?.addEventListener("input", (e) => {
@@ -348,6 +387,11 @@ function wireEvents() {
     const v = e.target.value.trim();
     state.settings.gmailClientId = v;
     setDirty(true, { silent: true });
+  });
+
+  // library events
+  els.saveAsNewBtn?.addEventListener("click", () => {
+    saveCurrentAsNew();
   });
 
   els.connectGmailBtn?.addEventListener("click", async () => {
@@ -387,7 +431,7 @@ function wireEvents() {
 
 async function loadFromStorage() {
   try {
-    const { activeFlow, flowName, settings, flowUiState } = await chrome.storage.local.get(["activeFlow", "flowName", "settings", "flowUiState"]);
+    const { activeFlow, flowName, settings, flowUiState, savedFlows } = await chrome.storage.local.get(["activeFlow", "flowName", "settings", "flowUiState", "savedFlows"]);
     const sanitized = sanitizeFlowArray(activeFlow);
     state.steps = sanitized.length ? sanitized : cloneFlow(DEFAULT_FLOW);
     state.flowName = typeof flowName === "string" && flowName.trim() ? flowName : DEFAULT_FLOW_NAME;
@@ -402,8 +446,18 @@ async function loadFromStorage() {
     state.waitCountdowns = typeof ui.waitCountdowns === 'object' && ui.waitCountdowns ? ui.waitCountdowns : {};
     state.nestedWaitCountdowns = typeof ui.nestedWaitCountdowns === 'object' && ui.nestedWaitCountdowns ? ui.nestedWaitCountdowns : {};
     state.runCount = Number(ui.iterCount) || 0;
+    state.savedFlows = Array.isArray(savedFlows) ? savedFlows : [];
     snapshotAsSaved();
     setDirty(false, { silent: true });
+    // restore running state (treat stale UI state as not running)
+    try {
+      const uiRunning = flowUiState?.isRunning === true;
+      const last = Number(flowUiState?.lastUpdatedAt) || 0;
+      const stale = !last || (Date.now() - last > 5000);
+      const anyActive = state.stepStatuses.some(s => s === 'pending' || s === 'running');
+      state.isRunning = (uiRunning && !stale) || anyActive;
+      updateRunButton();
+    } catch {}
   } catch (err) {
     console.warn("[options] Failed to load stored flow, using defaults:", err);
     state.steps = cloneFlow(DEFAULT_FLOW);
@@ -415,6 +469,7 @@ async function loadFromStorage() {
     state.waitCountdowns = {};
     state.nestedWaitCountdowns = {};
     state.runCount = 0;
+    state.savedFlows = [];
     snapshotAsSaved();
     setDirty(false, { silent: true });
   }
@@ -424,6 +479,7 @@ function render() {
   renderSteps();
   els.flowName.value = state.flowName;
   if (els.runCounter) els.runCounter.textContent = `Runs: ${state.runCount || 0}`;
+  if (els.runCounter) els.runCounter.style.display = (state.runCount && state.runCount > 0) ? '' : 'none';
   // settings reflect
   if (els.stepDelayMs) els.stepDelayMs.value = String(state.settings.stepDelayMs ?? DEFAULT_SETTINGS.stepDelayMs);
   if (els.selectorWaitMs) els.selectorWaitMs.value = String(state.settings.selectorWaitMs ?? DEFAULT_SETTINGS.selectorWaitMs);
@@ -442,6 +498,7 @@ function render() {
   }
   updateEmptyState();
   setControlsDisabled(Boolean(state.pendingPicker));
+  updateControlsForTab();
   if (state.pendingPicker) {
     showStatus(PICKER_STATUS_TEXT, { persistent: true });
   } else if (state.dirty) {
@@ -611,6 +668,25 @@ function buildFields(container, schema, step, stepIndex) {
   if (!schema) return;
 
   schema.fields.forEach((field) => {
+    // Dynamic options for Restart.ifIndex and mode-dependent visibility
+    if (schema.type === 'Restart' && field.key === 'ifIndex') {
+      const wrap = document.createElement('div'); wrap.className = 'field';
+      const label = document.createElement('label'); label.textContent = field.label; wrap.appendChild(label);
+      const sel = document.createElement('select');
+      const list = listTopLevelIfs();
+      if (list.length === 0) {
+        const o = document.createElement('option'); o.value = ''; o.textContent = '(no If steps found)'; sel.appendChild(o); sel.disabled = true;
+      } else {
+        list.forEach((opt) => { const o = document.createElement('option'); o.value = String(opt.value); o.textContent = opt.label; sel.appendChild(o); });
+        const existing = step[field.key]; if (existing !== undefined && existing !== null) sel.value = String(existing);
+        sel.addEventListener('change', (e) => { updateFieldValue(stepIndex, field, e.target.value); setDirty(true, { silent: true }); });
+      }
+      // hide when mode !== 'if'
+      const applyVis = () => { const m = (step.mode || 'flow'); wrap.style.display = m === 'if' ? '' : 'none'; };
+      applyVis();
+      wrap.appendChild(sel); container.appendChild(wrap);
+      return;
+    }
     // Custom renderer for SelectFiles.files
     if (schema.type === "SelectFiles" && field.key === "files") {
       const wrapper = document.createElement("div");
@@ -864,6 +940,10 @@ function buildFields(container, schema, step, stepIndex) {
         const rawValue = event.target.value;
         setDirty(true, { silent: true });
         updateFieldValue(stepIndex, field, rawValue);
+        // If changing Restart mode, re-render to show If select
+        if (schema.type === 'Restart' && field.key === 'mode') {
+          render();
+        }
       });
     } else {
       input.addEventListener("input", (event) => {
@@ -1639,6 +1719,10 @@ function createStepFromSchema(schema) {
     base.then = [];
     base.else = [];
   }
+  if (schema.type === 'Restart') {
+    if (base.mode == null) base.mode = 'flow';
+    if (base.ifIndex == null) base.ifIndex = '';
+  }
   return base;
 }
 
@@ -1745,6 +1829,117 @@ function snapshotAsSaved() {
   };
 }
 
+// -------- Saved Flows (Library) --------
+function renderLibrary() {
+  const list = els.savedFlowsContainer;
+  if (!list) return;
+  list.innerHTML = "";
+  const flows = Array.isArray(state.savedFlows) ? state.savedFlows : [];
+  if (!flows.length) {
+    els.savedEmptyState?.classList.remove("hidden");
+    return;
+  }
+  els.savedEmptyState?.classList.add("hidden");
+  flows.forEach((f) => {
+    const card = document.createElement("article");
+    card.className = "step-card";
+    const header = document.createElement("div"); header.className = "step-header";
+    const title = document.createElement("span"); title.className = "step-title"; title.textContent = f.name || "Flow";
+    const actions = document.createElement("div"); actions.className = "step-actions";
+    const loadBtn = document.createElement("button"); loadBtn.type = "button"; loadBtn.className = "icon"; loadBtn.title = "Load into editor"; loadBtn.textContent = "⤴";
+    const exportBtn = document.createElement("button"); exportBtn.type = "button"; exportBtn.className = "icon"; exportBtn.title = "Export JSON"; exportBtn.textContent = "⇩";
+    const updateBtn = document.createElement("button"); updateBtn.type = "button"; updateBtn.className = "icon"; updateBtn.title = "Update with current"; updateBtn.textContent = "⟳";
+    const renameBtn = document.createElement("button"); renameBtn.type = "button"; renameBtn.className = "icon"; renameBtn.title = "Rename"; renameBtn.textContent = "✎";
+    const delBtn = document.createElement("button"); delBtn.type = "button"; delBtn.className = "icon danger"; delBtn.title = "Delete"; delBtn.textContent = "✕";
+    actions.appendChild(loadBtn); actions.appendChild(exportBtn); actions.appendChild(updateBtn); actions.appendChild(renameBtn); actions.appendChild(delBtn);
+    header.appendChild(title); header.appendChild(actions);
+    card.appendChild(header);
+    const meta = document.createElement("div"); meta.style.fontSize = "12px"; meta.style.color = "var(--text-light)"; meta.textContent = new Date(f.updatedAt || Date.now()).toLocaleString();
+    card.appendChild(meta);
+    list.appendChild(card);
+
+    loadBtn.addEventListener("click", () => loadSavedFlow(f.id));
+    exportBtn.addEventListener("click", () => exportFlowData(f.steps || [], f.name || "flow"));
+    updateBtn.addEventListener("click", async () => { await updateSavedFlowWithCurrent(f.id); });
+    renameBtn.addEventListener("click", async () => {
+      const nn = prompt("New name", f.name || "");
+      if (nn == null) return; const name = nn.trim(); if (!name) return;
+      await renameSavedFlow(f.id, name);
+      renderLibrary();
+    });
+    delBtn.addEventListener("click", async () => {
+      if (!confirm(`Delete saved flow “${f.name}”?`)) return;
+      await deleteSavedFlow(f.id);
+      renderLibrary();
+    });
+  });
+}
+
+async function saveCurrentAsNew(name) {
+  const nm = (state.flowName || name || "").trim();
+  if (!nm) { alert("Enter a flow name"); return; }
+  const prepared = validateAndPrepare(); if (!prepared) return;
+  const item = { id: `sf_${Date.now()}_${Math.random().toString(16).slice(2)}`, name: nm, steps: prepared.steps, updatedAt: Date.now() };
+  const cur = Array.isArray(state.savedFlows) ? state.savedFlows.slice() : [];
+  cur.unshift(item);
+  state.savedFlows = cur;
+  await chrome.storage.local.set({ savedFlows: cur });
+  if (els.saveAsName) els.saveAsName.value = "";
+  showStatus("Saved current flow to library.");
+  renderLibrary();
+}
+
+async function deleteSavedFlow(id) {
+  const cur = Array.isArray(state.savedFlows) ? state.savedFlows.slice() : [];
+  const next = cur.filter((f) => f.id !== id);
+  state.savedFlows = next;
+  await chrome.storage.local.set({ savedFlows: next });
+  showStatus("Deleted saved flow.");
+}
+
+async function renameSavedFlow(id, name) {
+  const cur = Array.isArray(state.savedFlows) ? state.savedFlows.slice() : [];
+  const idx = cur.findIndex((f) => f.id === id);
+  if (idx < 0) return;
+  cur[idx] = { ...cur[idx], name: name.trim(), updatedAt: Date.now() };
+  state.savedFlows = cur;
+  await chrome.storage.local.set({ savedFlows: cur });
+  showStatus("Renamed.");
+}
+
+function loadSavedFlow(id) {
+  const f = (state.savedFlows || []).find((x) => x.id === id);
+  if (!f) return;
+  state.steps = sanitizeFlowArray(f.steps);
+  state.flowName = f.name || state.flowName;
+  state.stepStatuses = state.steps.map(() => "idle");
+  state.nestedStatuses = {}; state.ifResults = {}; state.waitCountdowns = {}; state.nestedWaitCountdowns = {};
+  setDirty(true);
+  render();
+  showStatus("Loaded flow from library. Save to persist.");
+}
+
+function exportFlowData(steps, flowName) {
+  const payload = { name: flowName || "flow", steps: sanitizeFlowArray(steps) };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url; link.download = `${slugify(flowName || 'flow')}.json`;
+  document.body.appendChild(link); link.click(); document.body.removeChild(link); URL.revokeObjectURL(url);
+}
+
+async function updateSavedFlowWithCurrent(id) {
+  const prepared = validateAndPrepare(); if (!prepared) return;
+  const cur = Array.isArray(state.savedFlows) ? state.savedFlows.slice() : [];
+  const idx = cur.findIndex((f) => f.id === id);
+  if (idx < 0) return;
+  cur[idx] = { ...cur[idx], steps: prepared.steps, updatedAt: Date.now() };
+  state.savedFlows = cur;
+  await chrome.storage.local.set({ savedFlows: cur });
+  showStatus("Saved flow updated.");
+  renderLibrary();
+}
+
 function validateAndPrepare() {
   const errors = [];
   const preparedSteps = [];
@@ -1833,6 +2028,16 @@ function validateAndPrepare() {
   }
 
   return { steps: preparedSteps, flowName };
+}
+
+function listTopLevelIfs() {
+  const res = [];
+  for (let i = 0; i < state.steps.length; i++) {
+    if (state.steps[i]?.type === 'If') {
+      res.push({ value: i, label: `Step ${i + 1} — If` });
+    }
+  }
+  return res;
 }
 
 async function requestSelectorPick({ stepIndex, field, ctx }) {
@@ -2058,11 +2263,47 @@ async function triggerRunFlow() {
 function initTabs() { selectTab("flow"); }
 
 function selectTab(name) {
-  const flow = name === "flow";
-  els.tabFlowBtn?.classList.toggle("active", flow);
-  els.tabSettingsBtn?.classList.toggle("active", !flow);
-  els.tabFlow?.classList.toggle("hidden", !flow);
-  els.tabSettings?.classList.toggle("hidden", flow);
+  const isFlow = name === "flow";
+  const isSettings = name === "settings";
+  const isLibrary = name === "library";
+  state.activeTab = name;
+  // toggle buttons
+  els.tabFlowBtn?.classList.toggle("active", isFlow);
+  els.tabSettingsBtn?.classList.toggle("active", isSettings);
+  els.tabLibraryBtn?.classList.toggle("active", isLibrary);
+  // toggle panels
+  els.tabFlow?.classList.toggle("hidden", !isFlow);
+  els.tabSettings?.classList.toggle("hidden", !isSettings);
+  els.tabLibrary?.classList.toggle("hidden", !isLibrary);
+  if (isLibrary) {
+    try { renderLibrary(); } catch {}
+  }
+  updateControlsForTab();
+}
+
+function updateControlsForTab() {
+  const tab = state.activeTab || 'flow';
+  const showFlowControls = tab === 'flow';
+  const showSaveBar = tab !== 'library'; // show Save/Discard on flow + settings
+  // top
+  if (els.addStep) els.addStep.style.display = showFlowControls ? '' : 'none';
+  if (els.runFlow) els.runFlow.style.display = showFlowControls ? '' : 'none';
+  if (els.runCounter) els.runCounter.style.display = showFlowControls ? '' : 'none';
+  // bottom save/discard
+  const saveBtn = els.saveFlow; const discardBtn = els.discardChanges;
+  if (saveBtn) saveBtn.style.display = showSaveBar ? '' : 'none';
+  if (discardBtn) discardBtn.style.display = showSaveBar ? '' : 'none';
+}
+
+function updateRunButton() {
+  if (!els.runFlow) return;
+  if (state.isRunning) {
+    els.runFlow.innerHTML = '⏹ Stop <span class="hg"></span>';
+    els.runFlow.classList.remove('primary');
+  } else {
+    els.runFlow.textContent = '▶ Run Flow';
+    els.runFlow.classList.add('primary');
+  }
 }
 
 // pin logic removed
@@ -2075,6 +2316,8 @@ function handleFlowStatus(msg) {
     state.ifResults = {};
     state.waitCountdowns = {};
     state.nestedWaitCountdowns = {};
+    state.isRunning = true;
+    updateRunButton();
     render();
     return;
   }
@@ -2087,6 +2330,10 @@ function handleFlowStatus(msg) {
     if (status === 'success' || status === 'error') {
       delete state.waitCountdowns[idx];
     }
+    // update running state: if any step pending/running -> running; else -> stopped
+    const anyActive = state.stepStatuses.some(s => s === 'pending' || s === 'running');
+    state.isRunning = anyActive;
+    updateRunButton();
     render();
   }
 }
