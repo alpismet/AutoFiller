@@ -1087,6 +1087,7 @@ function renderIfBranches(container, step, stepIndex) {
     actions.style.display = "flex";
     actions.style.gap = "8px";
     const add = document.createElement("button");
+    add.className = 'wide-add';
     add.type = "button";
     add.textContent = "＋ Add Step";
     add.addEventListener("click", () => {
@@ -1372,7 +1373,7 @@ function renderIfBranchesDeep(container, ctx) {
     const label = document.createElement('label'); label.textContent = labelText; section.appendChild(label);
     const list = document.createElement('div'); list.className = 'flows'; section.appendChild(list);
     const actions = document.createElement('div'); actions.style.display = 'flex'; actions.style.gap = '8px';
-    const add = document.createElement('button'); add.type = 'button'; add.textContent = '＋ Add Step';
+    const add = document.createElement('button'); add.type = 'button'; add.textContent = '＋ Add Step'; add.className = 'wide-add';
     add.addEventListener('click', () => {
       const st = stepRef(); if (!st) return;
       const arr = Array.isArray(st[key]) ? st[key] : [];

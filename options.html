@@ -277,6 +277,9 @@
     .menu { position: absolute; right: 0; top: 36px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); padding: 6px; display: grid; gap: 4px; min-width: 160px; z-index: 10; }
     .menu button { text-align: left; padding: 8px 10px; border-radius: 6px; }
     .menu button:hover { background: rgba(148,163,184,0.15); }
+    /* wide add button */
+    .wide-add { display: inline-block; width: 100%; text-align: center; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border-strong); background: var(--card-bg); }
+    .wide-add:hover { background: rgba(148,163,184,0.15); }
     /* hourglass: rotate 180° then hold ~2s */
     @keyframes halfturn-hold {
       0% { transform: rotate(0deg); }
@@ -347,12 +350,12 @@
     </div>
 
     <div class="top-bar">
-      <div class="left">
-        <button id="addStep" class="primary">＋ Add Step</button>
-      </div>
-      <div class="right">
+      <div class="left" style="gap:12px;">
         <button id="runFlow" class="primary">▶ Run Flow</button>
         <span id="runCounter" class="status">Runs: 0</span>
+      </div>
+      <div class="right" style="gap:12px;">
+        <button id="saveFlow" class="primary">💾 Save</button>
         <input id="importFlow" type="file" accept="application/json" hidden />
       </div>
     </div>
@@ -360,6 +363,9 @@
     <section id="tab-flow" class="tab-panel">
       <section id="stepsContainer" class="flows"></section>
       <div id="emptyState" class="empty-state hidden">No steps yet. Click “Add Step” to begin.</div>
+      <div class="setting-row" style="display:flex; gap:8px; margin: 8px 0 16px;">
+        <button id="addStep" class="wide-add">＋ Add Step</button>
+      </div>
     </section>
 
     <section id="tab-settings" class="tab-panel hidden">
@@ -419,8 +425,6 @@
     </section>
 
     <div class="bottom-bar">
-      <button id="saveFlow" class="primary">💾 Save</button>
-      <button id="discardChanges">Discard Changes</button>
       <div class="spacer"></div>
       <span id="status" class="status"></span>
     </div>
