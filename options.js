@@ -193,7 +193,8 @@ const state = {
   nestedWaitCountdowns: {} /* "parent|branch|child" -> seconds */,
   runCount: 0,
   savedFlows: [],
-  lastRunIncremented: false
+  lastRunIncremented: false,
+  stopSuppressUntil: 0
 };
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
@@ -230,6 +231,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   if (msg.type === "FLOW_ABORT") {
     state.isRunning = false;
+    state.stopSuppressUntil = 0;
     updateRunButton();
     return;
   }
@@ -326,13 +328,19 @@ function wireEvents() {
       try { await chrome.runtime.sendMessage({ type: "STOP_FLOW" }); showStatus("Stop requested."); } catch {}
       // reflect immediately
       state.isRunning = false; updateRunButton();
+      // suppress transient running states for a short window to avoid flicker
+      state.stopSuppressUntil = Date.now() + 2000;
       return;
     }
     const prepared = validateAndPrepare(); if (!prepared) return;
     await persistFlow({ steps: prepared.steps, flowName: prepared.flowName, silent: true });
-    // Reset runs counter when starting a new run
+    // Reset runs counter when starting a new run (both total and UI snapshot)
     state.runCount = 0;
-    try { await chrome.storage.local.set({ runCountTotal: 0 }); } catch {}
+    try {
+      const cur = await chrome.storage.local.get(["flowUiState"]);
+      const ui = { ...(cur?.flowUiState || {}), iterCount: 0 };
+      await chrome.storage.local.set({ runCountTotal: 0, flowUiState: ui });
+    } catch {}
     state.isRunning = true; updateRunButton(); render();
     const ok = await triggerRunFlow();
     if (ok) { showStatus("Flow dispatched to active tab."); } else { state.isRunning = false; updateRunButton(); }
@@ -447,7 +455,8 @@ async function loadFromStorage() {
     state.ifResults = typeof ui.ifResults === 'object' && ui.ifResults ? ui.ifResults : {};
     state.waitCountdowns = typeof ui.waitCountdowns === 'object' && ui.waitCountdowns ? ui.waitCountdowns : {};
     state.nestedWaitCountdowns = typeof ui.nestedWaitCountdowns === 'object' && ui.nestedWaitCountdowns ? ui.nestedWaitCountdowns : {};
-    state.runCount = Number(runCountTotal) || Number(ui.iterCount) || 0;
+    const hasTotal = runCountTotal !== undefined && runCountTotal !== null;
+    state.runCount = hasTotal ? (Number(runCountTotal) || 0) : (Number(ui.iterCount) || 0);
     state.savedFlows = Array.isArray(savedFlows) ? savedFlows : [];
     snapshotAsSaved();
     setDirty(false, { silent: true });
@@ -2319,6 +2328,7 @@ function handleFlowStatus(msg) {
     state.nestedWaitCountdowns = {};
     state.isRunning = true;
     state.lastRunIncremented = false;
+    state.stopSuppressUntil = 0;
     updateRunButton();
     render();
     return;
@@ -2340,7 +2350,9 @@ function handleFlowStatus(msg) {
       state.runCount = (Number(state.runCount) || 0) + 1;
       state.lastRunIncremented = true;
     }
-    state.isRunning = anyActive;
+    // Suppress transient running flips right after STOP was requested
+    const suppress = state.stopSuppressUntil && Date.now() < state.stopSuppressUntil;
+    state.isRunning = suppress ? false : anyActive;
     updateRunButton();
     render();
   }
