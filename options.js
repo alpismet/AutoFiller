@@ -218,6 +218,43 @@ const dndState = {
 };
 let dndHandlersBound = false;
 
+const DND_DEBUG = (() => {
+  try {
+    if (typeof localStorage === 'undefined') return true;
+    const stored = localStorage.getItem('autofiller:dndDebug');
+    if (stored === '0' || stored === 'false') return false;
+    if (stored === '1' || stored === 'true') return true;
+  } catch {}
+  return true;
+})();
+
+const dndDebugState = { lastCtxSig: null };
+
+function dndLog(event, detail) {
+  if (!DND_DEBUG) return;
+  if (detail !== undefined) console.log(`[DND] ${event}`, detail);
+  else console.log(`[DND] ${event}`);
+}
+
+function describeCtx(ctx) {
+  if (!ctx) return { type: 'none' };
+  if (ctx.type === 'root') return { type: 'root' };
+  return {
+    type: ctx.type,
+    branch: ctx.branch,
+    hostPath: Array.isArray(ctx.hostPath) ? ctx.hostPath : []
+  };
+}
+
+function logTargetChange(ctx, index, valid) {
+  if (!DND_DEBUG) return;
+  const host = ctx?.type === 'branch' ? JSON.stringify(ctx.hostPath || []) : '';
+  const signature = `${ctx?.type || 'none'}|${ctx?.branch || ''}|${host}|${valid ? 1 : 0}`;
+  if (dndDebugState.lastCtxSig === signature) return;
+  dndDebugState.lastCtxSig = signature;
+  dndLog(valid ? 'target' : 'target-denied', { ctx: describeCtx(ctx), index });
+}
+
 function markListDroppable(listEl, hostPath = [], branch = 'root') {
   if (!listEl) return;
   try {
@@ -226,6 +263,57 @@ function markListDroppable(listEl, hostPath = [], branch = 'root') {
     listEl.dataset.hostPath = '[]';
   }
   listEl.dataset.branch = branch;
+  bindDropZoneHandlers(listEl);
+}
+
+function bindDropZoneHandlers(listEl) {
+  if (!listEl || listEl.__dndBound) return;
+  const handleDragOver = (event) => {
+    if (!dndState.active) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const ctx = getContextFromList(listEl);
+    if (!ctx) return;
+    const invalid = isDropIntoOwnSubtree(dndState.srcPath, ctx);
+    if (invalid) {
+      setCurrentDropTarget(listEl, ctx, -1, false);
+      try { event.dataTransfer.dropEffect = 'none'; } catch {}
+      return;
+    }
+    const index = computeDropIndex(listEl, event.clientY);
+    setCurrentDropTarget(listEl, ctx, index, true);
+    try { event.dataTransfer.dropEffect = 'move'; } catch {}
+  };
+  const handleDrop = (event) => {
+    if (!dndState.active) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const ctx = getContextFromList(listEl);
+    if (!ctx) return;
+    const invalid = isDropIntoOwnSubtree(dndState.srcPath, ctx);
+    if (invalid) {
+      setCurrentDropTarget(listEl, ctx, -1, false);
+      return;
+    }
+    const index = computeDropIndex(listEl, event.clientY);
+    setCurrentDropTarget(listEl, ctx, index, true);
+    finalizeDrop(event, { ctx, index, listEl });
+  };
+  const handleDragLeave = (event) => {
+    if (!dndState.active) return;
+    const related = event.relatedTarget;
+    if (related && (related === listEl || (related instanceof Element && listEl.contains(related)))) {
+      return;
+    }
+    if (dndState.targetList === listEl) {
+      clearCurrentDropTarget();
+      removeDropIndicator();
+    }
+  };
+  listEl.addEventListener('dragover', handleDragOver);
+  listEl.addEventListener('drop', handleDrop);
+  listEl.addEventListener('dragleave', handleDragLeave);
+  listEl.__dndBound = { handleDragOver, handleDrop, handleDragLeave };
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
@@ -1794,25 +1882,62 @@ function setupStepCardDnD(card, path) {
   card.dataset.path = JSON.stringify(path);
   card.addEventListener('dragstart', onCardDragStart);
   card.addEventListener('dragend', onCardDragEnd);
+  card.addEventListener('dragover', onCardDragOverWithinCard);
+}
+
+function onCardDragOverWithinCard(event) {
+  if (!dndState.active || event.currentTarget !== dndState.dragCard) return;
+  event.preventDefault();
 }
 
 function setupGlobalDnDHandlers() {
   if (dndHandlersBound) return;
   document.addEventListener('dragover', onDocumentDragOver, true);
-  document.addEventListener('drop', onDocumentDrop, true);
+  document.addEventListener('drop', onDocumentDrop, false);
   window.addEventListener('blur', resetDndState, true);
   dndHandlersBound = true;
 }
 
+function finalizeDrop(event, overrides = {}) {
+  if (!dndState.active) return false;
+  const srcPath = Array.isArray(dndState.srcPath) ? dndState.srcPath.slice() : null;
+  let targetCtx = overrides.ctx ?? (dndState.targetValid ? dndState.targetCtx : null);
+  let targetIndex = overrides.index ?? (dndState.targetValid ? dndState.targetIndex : -1);
+  let listEl = overrides.listEl ?? dndState.targetList;
+  if (!targetCtx || !listEl) {
+    const fallbackList = findListElement(event?.target);
+    if (!targetCtx && fallbackList) targetCtx = getContextFromList(fallbackList);
+    if (!listEl && fallbackList) listEl = fallbackList;
+  }
+  if (targetCtx && targetIndex < 0 && listEl) {
+    targetIndex = computeDropIndex(listEl, event?.clientY ?? 0);
+  }
+  const payload = { srcPath, targetCtx: describeCtx(targetCtx), targetIndex };
+  if (!srcPath || !targetCtx) {
+    dndLog('drop-abort', payload);
+    resetDndState();
+    return false;
+  }
+  const changed = applyMoveStep(srcPath, targetCtx, targetIndex);
+  dndLog('drop-finalized', { ...payload, changed });
+  resetDndState();
+  render();
+  if (changed) setDirty(true, { silent: true });
+  return changed;
+}
+
 function onCardDragStart(event) {
-  console.log('[DRAG] START');
+  if (event?.stopPropagation) {
+    event.stopPropagation();
+  }
+  dndLog('drag-start');
   if (state.pendingPicker) {
     event.preventDefault();
     return;
   }
   const card = event.currentTarget;
   const path = parsePath(card?.dataset?.path);
-  console.log('[DRAG] Path:', path);
+  dndLog('drag-path', path);
   if (!Array.isArray(path)) {
     event.preventDefault();
     return;
@@ -1832,6 +1957,7 @@ function onCardDragStart(event) {
   dndState.targetValid = false;
   card.classList.add('dragging');
   document.body.classList.add('dragging-active');
+  dndDebugState.lastCtxSig = null;
   try {
     event.dataTransfer.effectAllowed = 'move';
     event.dataTransfer.setData(DND_MIME, JSON.stringify(path));
@@ -1839,28 +1965,24 @@ function onCardDragStart(event) {
   } catch {}
 }
 
-function onCardDragEnd() {
+function onCardDragEnd(event) {
+  if (event?.stopPropagation) {
+    event.stopPropagation();
+  }
   resetDndState();
 }
 
 function onDocumentDragOver(event) {
   if (!dndState.active) return;
-  
-  // Temporarily make the dragged card invisible to pointer events
   let originalPointerEvents = null;
   if (dndState.dragCard) {
     originalPointerEvents = dndState.dragCard.style.pointerEvents;
     dndState.dragCard.style.pointerEvents = 'none';
   }
-  
-  // Find the element at the cursor position
   const elementUnder = document.elementFromPoint(event.clientX, event.clientY);
-  
-  // Restore the dragged card's pointer events
   if (dndState.dragCard && originalPointerEvents !== null) {
     dndState.dragCard.style.pointerEvents = originalPointerEvents;
   }
-  
   const listEl = findListElement(elementUnder);
   if (!listEl) {
     clearCurrentDropTarget();
@@ -1886,37 +2008,9 @@ function onDocumentDragOver(event) {
 }
 
 function onDocumentDrop(event) {
-  console.log('[DRAG] DROP - srcPath:', dndState.srcPath, 'targetCtx:', dndState.targetCtx);
   if (!dndState.active) return;
   event.preventDefault();
-  const srcPath = dndState.srcPath ? dndState.srcPath.slice() : null;
-  let targetCtx = dndState.targetValid ? dndState.targetCtx : null;
-  let targetIndex = dndState.targetValid ? dndState.targetIndex : -1;
-  let targetList = dndState.targetValid ? dndState.targetList : null;
-
-  if (!targetCtx) {
-    targetList = findListElement(event.target);
-    targetCtx = getContextFromList(targetList);
-  }
-
-  if (targetCtx && srcPath) {
-    targetCtx = adjustContextForRemoval(targetCtx, srcPath);
-  }
-
-  if (targetCtx && targetIndex < 0) {
-    const listEl = targetList || findListElement(event.target);
-    if (listEl) targetIndex = computeDropIndex(listEl, event.clientY);
-  }
-
-  resetDndState();
-  if (!srcPath || !targetCtx) {
-    console.log('[DRAG] DROP ABORTED');
-    return;
-  }
-  const changed = applyMoveStep(srcPath, targetCtx, targetIndex);
-  console.log('[DRAG] DROP RESULT:', changed);
-  render();
-  if (changed) setDirty(true, { silent: true });
+  finalizeDrop(event);
 }
 
 function resetDndState() {
@@ -1946,6 +2040,10 @@ function clearCurrentDropTarget() {
   dndState.targetCtx = null;
   dndState.targetIndex = -1;
   dndState.targetValid = false;
+  if (dndDebugState.lastCtxSig !== null) {
+    dndLog('target-clear');
+    dndDebugState.lastCtxSig = null;
+  }
 }
 
 function setCurrentDropTarget(listEl, ctx, index, valid) {
@@ -1958,6 +2056,7 @@ function setCurrentDropTarget(listEl, ctx, index, valid) {
     listEl.classList.add('drop-denied-highlight');
     removeDropIndicator();
     Array.from(listEl.children).forEach((child) => child.classList?.remove('drop-hover'));
+    logTargetChange(ctx, index, false);
     dndState.targetList = listEl;
     dndState.targetCtx = null;
     dndState.targetIndex = -1;
@@ -1972,6 +2071,7 @@ function setCurrentDropTarget(listEl, ctx, index, valid) {
   dndState.targetCtx = ctx;
   dndState.targetIndex = index;
   dndState.targetValid = true;
+  logTargetChange(ctx, index, true);
 }
 
 function positionDropIndicator(listEl, index) {
@@ -2003,15 +2103,12 @@ function highlightHoverCards(listEl, index) {
 
 function computeDropIndex(listEl, clientY) {
   const cards = getChildCards(listEl, true);
-  console.log('[DRAG] computeDropIndex - cards.length:', cards.length, 'clientY:', clientY);
   if (cards.length === 0) return 0;
   for (let i = 0; i < cards.length; i++) {
     const rect = cards[i].getBoundingClientRect();
     const midpoint = rect.top + rect.height / 2;
-    console.log('[DRAG]   card', i, '- midpoint:', midpoint, 'clientY:', clientY, 'return:', clientY < midpoint ? i : '(continue)');
     if (clientY < midpoint) return i;
   }
-  console.log('[DRAG]   returning cards.length:', cards.length);
   return cards.length;
 }
 
@@ -2161,7 +2258,7 @@ function isDropIntoOwnSubtree(srcPath, targetCtx) {
   }
   
   // hostPath starts with srcPath and is longer - this IS a descendant
-  console.log('[DRAG] Blocking drop - target is descendant of source');
+  dndLog('blocked-descendant', { srcPath, targetCtx: describeCtx(targetCtx) });
   return true;
 }
 
@@ -2273,23 +2370,23 @@ function applyMoveStep(srcPath, targetCtx, rawIndex) {
   let insertIndex = Number.isInteger(rawIndex) ? rawIndex : 0;
   insertIndex = Math.max(0, insertIndex);
   const sameContainer = contextsMatch(srcCtx, adjustedCtx);
-  
-  console.log('[DRAG] applyMoveStep:', {
+
+  dndLog('apply-move', {
     srcPath,
     originalIndex,
     insertIndex,
     rawIndex,
     sameContainer,
-    srcCtx,
-    adjustedCtx
+    srcCtx: describeCtx(srcCtx),
+    adjustedCtx: describeCtx(adjustedCtx)
   });
-  
+
   insertStepIntoContext(step, adjustedCtx, insertIndex, status);
   const noChange = sameContainer && originalIndex === insertIndex;
   if (!noChange) {
     resetFlowStatuses();
   }
-  console.log('[DRAG] noChange:', noChange, 'returning:', !noChange);
+  dndLog('apply-move-result', { noChange, changed: !noChange });
   return !noChange;
 }
 
