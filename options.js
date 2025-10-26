@@ -1378,6 +1378,11 @@ function buildFieldsNested(container, schema, step, ctx) {
       container.appendChild(wrapper); renderList(); return;
     }
 
+    // Hide FillText's built-in toggles (custom UI renders these)
+    if (schema.type === "FillText" && (field.key === "splitAcrossInputs" || field.key === "slowType" || field.key === "slowTypeDelayMs")) {
+      return;
+    }
+
     // FillText custom section
     if (schema.type === "FillText" && field.key === "value") {
       const inputSection = document.createElement("div"); inputSection.className = "field";
@@ -1598,7 +1603,19 @@ function createDeepNestedStepCard(parentCtx, nestedKey, childIndex, step, branch
 
 function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childIndex) {
   container.innerHTML = '';
+  const pathBase = Array.isArray(parentCtx.path)
+    ? parentCtx.path.slice()
+    : (typeof parentCtx.parentIndex === 'number'
+      ? [parentCtx.parentIndex, parentCtx.branchKey, parentCtx.childIndex]
+      : null);
+  const deepPath = Array.isArray(pathBase) ? [...pathBase, nestedKey, childIndex] : null;
+  const pickerCtx = deepPath ? { path: deepPath } : null;
   schema.fields.forEach((field) => {
+    // Hide FillText toggles duplicated by custom UI
+    if (schema.type === 'FillText' && (field.key === 'splitAcrossInputs' || field.key === 'slowType' || field.key === 'slowTypeDelayMs')) {
+      return;
+    }
+
     // For deep nested, keep it simple (no picker)
     const wrap = document.createElement('div'); wrap.className = 'field';
     const label = document.createElement('label'); label.textContent = field.label; wrap.appendChild(label);
@@ -1619,6 +1636,8 @@ function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childInd
       applySlowState();
       slowBtn.addEventListener('click', () => { const st = getDeepNestedStep(parentCtx, nestedKey, childIndex); st.slowType = !Boolean(st?.slowType); applySlowState(); setDirty(true, { silent: true }); });
       delayInput.addEventListener('input', (e) => { const v = Number(e.target.value); if (Number.isFinite(v) && v >= 0) { const st = getDeepNestedStep(parentCtx, nestedKey, childIndex); st.slowTypeDelayMs = v; setDirty(true, { silent: true }); } });
+      row.appendChild(slowBtn);
+      row.appendChild(delayInput);
       inputSection.appendChild(secLabel); inputSection.appendChild(row); container.appendChild(inputSection);
     }
 
@@ -1637,7 +1656,33 @@ function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childInd
     if (field.type === 'checkbox') { input.addEventListener('change', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, Boolean(e.target.checked)); }); }
     else if (field.type === 'select') { input.addEventListener('change', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, e.target.value); }); }
     else { input.addEventListener('input', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, e.target.value); }); }
-    wrap.appendChild(input);
+
+    let inputHost = input;
+    if (field.supportsPicker && pickerCtx) {
+      const row = document.createElement('div'); row.className = 'input-row';
+      row.appendChild(input);
+      const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'icon picker-btn'; btn.title = 'Pick element from active tab'; btn.textContent = '🎯';
+      const isActive = isPickerContext(undefined, field.key, pickerCtx);
+      btn.classList.toggle('active', isActive);
+      btn.disabled = Boolean(state.pendingPicker) && !isActive;
+      btn.addEventListener('click', () => { requestSelectorPick({ stepIndex: undefined, field, ctx: pickerCtx }); });
+      row.appendChild(btn);
+
+      const targetStep = getDeepNestedStep(parentCtx, nestedKey, childIndex);
+      const isClickSelector = targetStep?.type === 'Click' && field.key === 'selector';
+      if (isClickSelector) {
+        const forceBtn = document.createElement('button'); forceBtn.type = 'button'; forceBtn.className = 'toggle'; forceBtn.title = 'Force'; forceBtn.setAttribute('aria-label', 'Force click (native)'); forceBtn.textContent = '⚡';
+        const applyForceState = () => { const st = getDeepNestedStep(parentCtx, nestedKey, childIndex); const active = Boolean(st?.forceClick); forceBtn.classList.toggle('active', active); forceBtn.setAttribute('aria-pressed', String(active)); };
+        applyForceState();
+        forceBtn.addEventListener('click', () => { const st = getDeepNestedStep(parentCtx, nestedKey, childIndex); st.forceClick = !Boolean(st?.forceClick); applyForceState(); setDirty(true, { silent: true }); });
+        row.appendChild(forceBtn);
+      }
+
+      inputHost = row;
+      if (isActive) wrap.classList.add('picking'); else wrap.classList.remove('picking');
+    }
+
+    wrap.appendChild(inputHost);
     container.appendChild(wrap);
   });
 
