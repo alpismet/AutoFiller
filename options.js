@@ -1805,12 +1805,14 @@ function setupGlobalDnDHandlers() {
 }
 
 function onCardDragStart(event) {
+  console.log('[DRAG] START');
   if (state.pendingPicker) {
     event.preventDefault();
     return;
   }
   const card = event.currentTarget;
   const path = parsePath(card?.dataset?.path);
+  console.log('[DRAG] Path:', path);
   if (!Array.isArray(path)) {
     event.preventDefault();
     return;
@@ -1843,7 +1845,23 @@ function onCardDragEnd() {
 
 function onDocumentDragOver(event) {
   if (!dndState.active) return;
-  const listEl = findListElement(event.target);
+  
+  // Temporarily make the dragged card invisible to pointer events
+  let originalPointerEvents = null;
+  if (dndState.dragCard) {
+    originalPointerEvents = dndState.dragCard.style.pointerEvents;
+    dndState.dragCard.style.pointerEvents = 'none';
+  }
+  
+  // Find the element at the cursor position
+  const elementUnder = document.elementFromPoint(event.clientX, event.clientY);
+  
+  // Restore the dragged card's pointer events
+  if (dndState.dragCard && originalPointerEvents !== null) {
+    dndState.dragCard.style.pointerEvents = originalPointerEvents;
+  }
+  
+  const listEl = findListElement(elementUnder);
   if (!listEl) {
     clearCurrentDropTarget();
     try { event.dataTransfer.dropEffect = 'none'; } catch {}
@@ -1868,6 +1886,7 @@ function onDocumentDragOver(event) {
 }
 
 function onDocumentDrop(event) {
+  console.log('[DRAG] DROP - srcPath:', dndState.srcPath, 'targetCtx:', dndState.targetCtx);
   if (!dndState.active) return;
   event.preventDefault();
   const srcPath = dndState.srcPath ? dndState.srcPath.slice() : null;
@@ -1890,8 +1909,12 @@ function onDocumentDrop(event) {
   }
 
   resetDndState();
-  if (!srcPath || !targetCtx) return;
+  if (!srcPath || !targetCtx) {
+    console.log('[DRAG] DROP ABORTED');
+    return;
+  }
   const changed = applyMoveStep(srcPath, targetCtx, targetIndex);
+  console.log('[DRAG] DROP RESULT:', changed);
   render();
   if (changed) setDirty(true, { silent: true });
 }
@@ -1980,12 +2003,15 @@ function highlightHoverCards(listEl, index) {
 
 function computeDropIndex(listEl, clientY) {
   const cards = getChildCards(listEl, true);
+  console.log('[DRAG] computeDropIndex - cards.length:', cards.length, 'clientY:', clientY);
   if (cards.length === 0) return 0;
   for (let i = 0; i < cards.length; i++) {
     const rect = cards[i].getBoundingClientRect();
     const midpoint = rect.top + rect.height / 2;
+    console.log('[DRAG]   card', i, '- midpoint:', midpoint, 'clientY:', clientY, 'return:', clientY < midpoint ? i : '(continue)');
     if (clientY < midpoint) return i;
   }
+  console.log('[DRAG]   returning cards.length:', cards.length);
   return cards.length;
 }
 
@@ -1998,11 +2024,24 @@ function getChildCards(listEl, excludeDragging = false) {
 }
 
 function findListElement(target) {
-  let el = target instanceof Element ? target : null;
-  while (el && !el.classList.contains('flows')) {
-    el = el.parentElement;
+  if (!target || !(target instanceof Element)) return null;
+  
+  // Start from the target and go up the DOM tree
+  let current = target;
+  let depth = 0;
+  const maxDepth = 50;
+  
+  while (current && depth < maxDepth) {
+    // Check if this element has the 'flows' class
+    if (current.classList && current.classList.contains('flows')) {
+      return current;
+    }
+    
+    current = current.parentElement;
+    depth++;
   }
-  return el;
+  
+  return null;
 }
 
 function getContextFromList(listEl) {
@@ -2100,11 +2139,29 @@ function arraysEqual(a, b) {
 function isDropIntoOwnSubtree(srcPath, targetCtx) {
   if (!Array.isArray(srcPath) || !targetCtx) return true;
   if (targetCtx.type !== 'branch') return false;
+  
   const host = Array.isArray(targetCtx.hostPath) ? targetCtx.hostPath : [];
-  if (host.length < srcPath.length) return false;
+  
+  // The check: we're dropping INTO our own subtree if the target's hostPath
+  // starts with our srcPath AND is longer (meaning it's a descendant)
+  // 
+  // Example: srcPath=[19] hostPath=[19] -> OK! (dropping into direct child branch)
+  // Example: srcPath=[19] hostPath=[19, "then", 0] -> NOT OK! (dropping into grandchild)
+  // Example: srcPath=[19, "then", 0] hostPath=[19] -> OK! (moving out)
+  
+  if (host.length <= srcPath.length) {
+    // hostPath is same length or shorter than srcPath
+    // This means target is NOT a descendant of source
+    return false;
+  }
+  
+  // hostPath is longer - check if it starts with srcPath
   for (let i = 0; i < srcPath.length; i++) {
     if (host[i] !== srcPath[i]) return false;
   }
+  
+  // hostPath starts with srcPath and is longer - this IS a descendant
+  console.log('[DRAG] Blocking drop - target is descendant of source');
   return true;
 }
 
@@ -2216,11 +2273,23 @@ function applyMoveStep(srcPath, targetCtx, rawIndex) {
   let insertIndex = Number.isInteger(rawIndex) ? rawIndex : 0;
   insertIndex = Math.max(0, insertIndex);
   const sameContainer = contextsMatch(srcCtx, adjustedCtx);
+  
+  console.log('[DRAG] applyMoveStep:', {
+    srcPath,
+    originalIndex,
+    insertIndex,
+    rawIndex,
+    sameContainer,
+    srcCtx,
+    adjustedCtx
+  });
+  
   insertStepIntoContext(step, adjustedCtx, insertIndex, status);
   const noChange = sameContainer && originalIndex === insertIndex;
   if (!noChange) {
     resetFlowStatuses();
   }
+  console.log('[DRAG] noChange:', noChange, 'returning:', !noChange);
   return !noChange;
 }
 

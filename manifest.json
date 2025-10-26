@@ -1,6 +1,6 @@
 {
   "name": "AutoFiller Flow Runner",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "manifest_version": 3,
   "description": "Runs predefined automation flow steps on websites.",
   "permissions": [
