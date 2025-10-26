@@ -220,12 +220,12 @@ let dndHandlersBound = false;
 
 const DND_DEBUG = (() => {
   try {
-    if (typeof localStorage === 'undefined') return true;
+    if (typeof localStorage === 'undefined') return false;
     const stored = localStorage.getItem('autofiller:dndDebug');
     if (stored === '0' || stored === 'false') return false;
     if (stored === '1' || stored === 'true') return true;
   } catch {}
-  return true;
+  return false;
 })();
 
 const dndDebugState = { lastCtxSig: null };
