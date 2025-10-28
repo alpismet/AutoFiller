@@ -3031,6 +3031,13 @@ function handleFlowStatus(msg) {
     if (status === 'success' || status === 'error') {
       delete state.waitCountdowns[idx];
     }
+    if (status === 'error' && msg.error) {
+      const raw = typeof msg.error === 'string' ? msg.error : '';
+      const cleaned = raw.replace(/^Error:\s*/, '').trim();
+      const stepLabel = state.steps[idx]?.type ? `${state.steps[idx].type} failed` : 'Step failed';
+      const message = cleaned ? `${stepLabel}: ${cleaned}` : stepLabel;
+      showStatus(message, { persistent: true });
+    }
     // update running state: if any step pending/running -> running; else -> stopped
     const anyActive = state.stepStatuses.some(s => s === 'pending' || s === 'running');
     // If final step just marked success and nothing active, ensure counter increments once
