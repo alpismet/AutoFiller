@@ -13,6 +13,28 @@ let offscreenCreationPromise = null;
 let activePicker = null;
 let isFlowRunning = false;
 let stopRequested = false;
+
+function getRestartOutcome(step) {
+  if (typeof step !== "object" || !step) return null;
+  if (typeof step._remaining !== "number") {
+    const maxRaw = Number(step.max);
+    if (maxRaw === -1) step._remaining = Infinity;
+    else if (Number.isFinite(maxRaw) && maxRaw > 0) step._remaining = Math.floor(maxRaw);
+    else step._remaining = 1;
+  }
+  if (step._remaining === 0) return null;
+  if (step._remaining !== Infinity) step._remaining -= 1;
+  const outcome = { restartRequested: true };
+  if (step.mode === "if") {
+    const rawIdx = step.ifIndex;
+    const idx = (typeof rawIdx === 'string' && rawIdx.trim() === '') ? NaN : Number(rawIdx);
+    if (Number.isFinite(idx)) {
+      if (idx >= 0) outcome.jumpToIfIndex = idx;
+      else if (idx < 0) outcome.targetDepth = Math.max(1, Math.abs(idx));
+    }
+  }
+  return outcome;
+}
 const STEP_SANITIZERS = {
   GoToURL(step) {
     const url = typeof step.url === "string" ? step.url.trim() : "";
@@ -59,7 +81,7 @@ const STEP_SANITIZERS = {
     }
     const mode = (typeof step.mode === 'string' && step.mode.toLowerCase() === 'if') ? 'if' : 'flow';
     const idx = Number(step.ifIndex);
-    const ifIndex = Number.isFinite(idx) && idx >= 0 ? idx : -1;
+    const ifIndex = Number.isFinite(idx) ? idx : -1;
     return { type: 'Restart', max, mode, ifIndex };
   },
   SelectFiles(step) {
@@ -457,18 +479,23 @@ async function runFlow(flow, tabId) {
           await wait(250);
         }
       } else if (step.type === 'Restart') {
-        // initialize remaining budget if needed
-        if (typeof step._remaining !== 'number') step._remaining = (step.max === -1) ? Infinity : (Number(step.max) || 1);
-        if (step._remaining === Infinity || step._remaining > 0) {
-          if (step._remaining !== Infinity) step._remaining -= 1;
-          // reset statuses and restart from the beginning
+        const restartOutcome = getRestartOutcome(step);
+        if (restartOutcome && restartOutcome.restartRequested) {
           broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
           iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
-          if (step.mode === 'if' && Number.isFinite(step.ifIndex) && step.ifIndex >= 0 && step.ifIndex < flow.length && flow[step.ifIndex]?.type === 'If') {
-            i = step.ifIndex - 1; // jump to selected If (next loop increments)
+          if (restartOutcome.jumpToIfIndex != null && Number.isFinite(restartOutcome.jumpToIfIndex)) {
+            const target = restartOutcome.jumpToIfIndex;
+            if (target >= 0 && target < flow.length && flow[target]?.type === 'If') {
+              i = target - 1;
+            } else {
+              i = -1;
+            }
+          } else if (restartOutcome.targetDepth != null && restartOutcome.targetDepth <= 1) {
+            i -= 1;
           } else {
-            i = -1; // flow start
+            i = -1;
           }
+          continue;
         }
       } else if (step.type === 'If') {
         await ensureContentScript(tabId);
@@ -479,12 +506,26 @@ async function runFlow(flow, tabId) {
         if (Array.isArray(branch) && branch.length) {
           const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else', path: [i, (cond ? 'then' : 'else')] });
           if (outcome && outcome.restartRequested) {
-            broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
-            iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
-            if (Number.isFinite(outcome.jumpToIfIndex) && outcome.jumpToIfIndex >= 0 && outcome.jumpToIfIndex < flow.length && flow[outcome.jumpToIfIndex]?.type === 'If') {
-              i = outcome.jumpToIfIndex - 1;
-            } else {
+            if (outcome.targetDepth != null && outcome.targetDepth > 1) {
+              outcome.targetDepth = outcome.targetDepth - 1;
+              // propagate to higher level by pretending it is a flow restart
+              broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+              iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
               i = -1;
+              continue;
+            } else if (outcome.targetDepth != null && outcome.targetDepth <= 1) {
+              i -= 1;
+              continue;
+            } else if (Number.isFinite(outcome.jumpToIfIndex) && outcome.jumpToIfIndex >= 0 && outcome.jumpToIfIndex < flow.length && flow[outcome.jumpToIfIndex]?.type === 'If') {
+              broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+              iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
+              i = outcome.jumpToIfIndex - 1;
+              continue;
+            } else {
+              broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+              iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
+              i = -1;
+              continue;
             }
           }
         }
@@ -555,15 +596,13 @@ async function runStepsInline(steps, tabId, ctx) {
           await wait(250);
         }
       } else if (step.type === 'Restart') {
-        if (typeof step._remaining !== 'number') step._remaining = (step.max === -1) ? Infinity : (Number(step.max) || 1);
-        if (step._remaining === Infinity || step._remaining > 0) {
-          if (step._remaining !== Infinity) step._remaining -= 1;
-          const jump = (step.mode === 'if' && Number.isFinite(step.ifIndex) && step.ifIndex >= 0) ? step.ifIndex : null;
+        const restartOutcome = getRestartOutcome(step);
+        if (restartOutcome && restartOutcome.restartRequested) {
           if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
             const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
             try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, status: 'success' }); } catch {}
           }
-          return { restartRequested: true, jumpToIfIndex: jump };
+          return restartOutcome;
         }
       } else if (step.type === 'If') {
         await ensureContentScript(tabId);
@@ -573,7 +612,16 @@ async function runStepsInline(steps, tabId, ctx) {
         if (Array.isArray(branch) && branch.length) {
           const path = Array.isArray(ctx.path) ? ctx.path.concat(i, (cond ? 'then' : 'else')) : [ctx.parentIndex, ctx.branchKey || 'then', i, (cond ? 'then' : 'else')];
           const outcome = await runStepsInline(branch, tabId, { ...ctx, path });
-          if (outcome && outcome.restartRequested) return { restartRequested: true };
+          if (outcome && outcome.restartRequested) {
+            if (outcome.targetDepth != null && outcome.targetDepth > 1) {
+              return { restartRequested: true, targetDepth: outcome.targetDepth - 1, jumpToIfIndex: outcome.jumpToIfIndex };
+            }
+            if (outcome.targetDepth != null && outcome.targetDepth <= 1) {
+              i -= 1;
+              continue;
+            }
+            return outcome;
+          }
         }
       } else {
         await ensureContentScript(tabId);

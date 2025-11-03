@@ -713,7 +713,7 @@ function createStepCard(step, index) {
     });
   });
 
-  buildFields(fieldsContainer, schema, step, index);
+  buildFields(fieldsContainer, schema, step, index, { path: [index] });
 
   if (schema.type === "If") {
     renderIfBranches(fieldsContainer, step, index);
@@ -794,28 +794,89 @@ async function runSingleStep(index) {
   }
 }
 
-function buildFields(container, schema, step, stepIndex) {
+function buildFields(container, schema, step, stepIndex, ctx = {}) {
   container.innerHTML = "";
   if (!schema) return;
 
   schema.fields.forEach((field) => {
     // Dynamic options for Restart.ifIndex and mode-dependent visibility
     if (schema.type === 'Restart' && field.key === 'ifIndex') {
+      const path = Array.isArray(ctx?.path) ? ctx.path.slice() : [stepIndex];
+      const ancestors = collectAncestorIfs(path);
       const wrap = document.createElement('div'); wrap.className = 'field';
-      const label = document.createElement('label'); label.textContent = field.label; wrap.appendChild(label);
-      const sel = document.createElement('select');
-      const list = listTopLevelIfs();
-      if (list.length === 0) {
-        const o = document.createElement('option'); o.value = ''; o.textContent = '(no If steps found)'; sel.appendChild(o); sel.disabled = true;
+      const label = document.createElement('label'); wrap.appendChild(label);
+
+      const applyVis = () => {
+        const m = (step.mode || 'flow');
+        wrap.style.display = m === 'if' ? '' : 'none';
+      };
+
+      const ensureValue = (val) => {
+        if (step[field.key] !== val) {
+          step[field.key] = val;
+        }
+      };
+
+      if (ancestors.length > 0) {
+        label.textContent = 'If node';
+        const current = Number(step[field.key]);
+        if (!Number.isFinite(current) || current >= 0 || Math.abs(current) > ancestors.length) {
+          ensureValue(-ancestors[0].depth);
+        }
+        if (ancestors.length === 1) {
+          const info = document.createElement('div');
+          info.className = 'info-text';
+          info.textContent = ancestors[0].label;
+          info.style.fontSize = '13px';
+          info.style.color = 'var(--text-light)';
+          wrap.appendChild(info);
+        } else {
+          const sel = document.createElement('select');
+          ancestors.forEach((opt) => {
+            const option = document.createElement('option');
+            option.value = String(-opt.depth);
+            option.textContent = opt.label;
+            sel.appendChild(option);
+          });
+          sel.value = String(step[field.key]);
+          sel.addEventListener('change', (e) => {
+            const val = Number(e.target.value);
+            updateFieldValue(stepIndex, field, val);
+            setDirty(true, { silent: true });
+          });
+          wrap.appendChild(sel);
+        }
       } else {
-        list.forEach((opt) => { const o = document.createElement('option'); o.value = String(opt.value); o.textContent = opt.label; sel.appendChild(o); });
-        const existing = step[field.key]; if (existing !== undefined && existing !== null) sel.value = String(existing);
-        sel.addEventListener('change', (e) => { updateFieldValue(stepIndex, field, e.target.value); setDirty(true, { silent: true }); });
+        label.textContent = field.label;
+        const sel = document.createElement('select');
+        const list = listTopLevelIfs();
+        if (list.length === 0) {
+          const o = document.createElement('option'); o.value = ''; o.textContent = '(no If steps found)'; sel.appendChild(o); sel.disabled = true;
+        } else {
+          list.forEach((opt) => {
+            const option = document.createElement('option');
+            option.value = String(opt.value);
+            option.textContent = opt.label;
+            sel.appendChild(option);
+          });
+          const existing = step[field.key];
+          if (existing === undefined || existing === null || existing === '') {
+            step[field.key] = list[0].value;
+            sel.value = String(list[0].value);
+          } else {
+            sel.value = String(existing);
+          }
+          sel.addEventListener('change', (e) => {
+            const val = Number(e.target.value);
+            updateFieldValue(stepIndex, field, val);
+            setDirty(true, { silent: true });
+          });
+        }
+        wrap.appendChild(sel);
       }
-      // hide when mode !== 'if'
-      const applyVis = () => { const m = (step.mode || 'flow'); wrap.style.display = m === 'if' ? '' : 'none'; };
+
       applyVis();
-      wrap.appendChild(sel); container.appendChild(wrap);
+      container.appendChild(wrap);
       return;
     }
     // Custom renderer for SelectFiles.files
@@ -1311,8 +1372,87 @@ function buildFieldsNested(container, schema, step, ctx) {
     const arr = Array.isArray(p[ctx.branchKey]) ? p[ctx.branchKey] : [];
     return arr[ctx.childIndex] || null;
   };
+  const stepPath = Array.isArray(ctx.path) ? ctx.path.slice() : [ctx.parentIndex, ctx.branchKey, ctx.childIndex];
 
   schema.fields.forEach((field) => {
+    if (schema.type === 'Restart' && field.key === 'ifIndex') {
+      const ancestors = collectAncestorIfs(stepPath);
+      const wrap = document.createElement('div'); wrap.className = 'field';
+      const label = document.createElement('label'); wrap.appendChild(label);
+
+      const applyVis = () => {
+        const m = (step.mode || 'flow');
+        wrap.style.display = m === 'if' ? '' : 'none';
+      };
+
+      const ensureValue = (val) => {
+        if (step[field.key] !== val) {
+          step[field.key] = val;
+        }
+      };
+
+      if (ancestors.length > 0) {
+        label.textContent = 'If node';
+        const current = Number(step[field.key]);
+        if (!Number.isFinite(current) || current >= 0 || Math.abs(current) > ancestors.length) {
+          ensureValue(-ancestors[0].depth);
+        }
+        if (ancestors.length === 1) {
+          const info = document.createElement('div');
+          info.className = 'info-text';
+          info.textContent = ancestors[0].label;
+          info.style.fontSize = '13px';
+          info.style.color = 'var(--text-light)';
+          wrap.appendChild(info);
+        } else {
+          const sel = document.createElement('select');
+          ancestors.forEach((opt) => {
+            const option = document.createElement('option');
+            option.value = String(-opt.depth);
+            option.textContent = opt.label;
+            sel.appendChild(option);
+          });
+          sel.value = String(step[field.key]);
+          sel.addEventListener('change', (e) => {
+            const val = Number(e.target.value);
+            updateNestedFieldValue(ctx.parentIndex, ctx.branchKey, ctx.childIndex, field, val);
+            setDirty(true, { silent: true });
+          });
+          wrap.appendChild(sel);
+        }
+      } else {
+        label.textContent = field.label;
+        const sel = document.createElement('select');
+        const list = listTopLevelIfs();
+        if (list.length === 0) {
+          const o = document.createElement('option'); o.value = ''; o.textContent = '(no If steps found)'; sel.appendChild(o); sel.disabled = true;
+        } else {
+          list.forEach((opt) => {
+            const option = document.createElement('option');
+            option.value = String(opt.value);
+            option.textContent = opt.label;
+            sel.appendChild(option);
+          });
+          const existing = step[field.key];
+          if (existing === undefined || existing === null || existing === '') {
+            step[field.key] = list[0].value;
+            sel.value = String(list[0].value);
+          } else {
+            sel.value = String(existing);
+          }
+          sel.addEventListener('change', (e) => {
+            const val = Number(e.target.value);
+            updateNestedFieldValue(ctx.parentIndex, ctx.branchKey, ctx.childIndex, field, val);
+            setDirty(true, { silent: true });
+          });
+        }
+        wrap.appendChild(sel);
+      }
+
+      applyVis();
+      container.appendChild(wrap);
+      return;
+    }
     // Custom renderer for SelectFiles.files
     if (schema.type === "SelectFiles" && field.key === "files") {
       const wrapper = document.createElement("div");
@@ -1610,7 +1750,73 @@ function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childInd
       : null);
   const deepPath = Array.isArray(pathBase) ? [...pathBase, nestedKey, childIndex] : null;
   const pickerCtx = deepPath ? { path: deepPath } : null;
+  const stepPath = Array.isArray(deepPath) ? deepPath.slice() : [];
   schema.fields.forEach((field) => {
+    if (schema.type === 'Restart' && field.key === 'ifIndex') {
+      const ancestors = collectAncestorIfs(stepPath);
+      const wrap = document.createElement('div'); wrap.className = 'field';
+      const label = document.createElement('label'); wrap.appendChild(label);
+
+      const applyVis = () => {
+        const m = (step.mode || 'flow');
+        wrap.style.display = m === 'if' ? '' : 'none';
+      };
+
+      const ensureValue = (val) => {
+        if (step[field.key] !== val) step[field.key] = val;
+      };
+
+      if (ancestors.length > 0) {
+        label.textContent = 'If node';
+        const current = Number(step[field.key]);
+        if (!Number.isFinite(current) || current >= 0 || Math.abs(current) > ancestors.length) {
+          ensureValue(-ancestors[0].depth);
+        }
+        if (ancestors.length === 1) {
+          const info = document.createElement('div'); info.className = 'info-text'; info.textContent = ancestors[0].label; info.style.fontSize = '13px'; info.style.color = 'var(--text-light)'; wrap.appendChild(info);
+        } else {
+          const sel = document.createElement('select');
+          ancestors.forEach((opt) => {
+            const option = document.createElement('option'); option.value = String(-opt.depth); option.textContent = opt.label; sel.appendChild(option);
+          });
+          sel.value = String(step[field.key]);
+          sel.addEventListener('change', (e) => {
+            const val = Number(e.target.value);
+            updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, val);
+            setDirty(true, { silent: true });
+          });
+          wrap.appendChild(sel);
+        }
+      } else {
+        label.textContent = field.label;
+        const sel = document.createElement('select');
+        const list = listTopLevelIfs();
+        if (list.length === 0) {
+          const o = document.createElement('option'); o.value = ''; o.textContent = '(no If steps found)'; sel.appendChild(o); sel.disabled = true;
+        } else {
+          list.forEach((opt) => {
+            const option = document.createElement('option'); option.value = String(opt.value); option.textContent = opt.label; sel.appendChild(option);
+          });
+          const existing = step[field.key];
+          if (existing === undefined || existing === null || existing === '') {
+            step[field.key] = list[0].value;
+            sel.value = String(list[0].value);
+          } else {
+            sel.value = String(existing);
+          }
+          sel.addEventListener('change', (e) => {
+            const val = Number(e.target.value);
+            updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, val);
+            setDirty(true, { silent: true });
+          });
+        }
+        wrap.appendChild(sel);
+      }
+
+      applyVis();
+      container.appendChild(wrap);
+      return;
+    }
     // Hide FillText toggles duplicated by custom UI
     if (schema.type === 'FillText' && (field.key === 'splitAcrossInputs' || field.key === 'slowType' || field.key === 'slowTypeDelayMs')) {
       return;
@@ -2233,6 +2439,56 @@ function containersToPath(containers) {
   return path;
 }
 
+function describeIfPath(path) {
+  if (!Array.isArray(path) || path.length === 0) return "If";
+  const parts = [];
+  const rootIndex = path[0];
+  if (typeof rootIndex === "number") {
+    parts.push(`Step ${rootIndex + 1}`);
+  }
+  for (let i = 1; i < path.length; i += 2) {
+    const branch = path[i];
+    const idx = path[i + 1];
+    if ((branch === "then" || branch === "else") && typeof idx === "number") {
+      parts.push(`${branch} ${idx + 1}`);
+    } else {
+      break;
+    }
+  }
+  return parts.join(" → ") || "If";
+}
+
+function collectAncestorIfs(path) {
+  const result = [];
+  if (!Array.isArray(path) || path.length === 0) return result;
+  if (typeof path[0] !== "number") return result;
+  const prefixes = [];
+  let prefix = [path[0]];
+  prefixes.push(prefix.slice());
+  for (let i = 1; i < path.length; i += 2) {
+    const branch = path[i];
+    const idx = path[i + 1];
+    if ((branch !== "then" && branch !== "else") || typeof idx !== "number") break;
+    prefix = prefix.concat([branch, idx]);
+    prefixes.push(prefix.slice());
+  }
+  prefixes.pop(); // remove current step path
+  let depth = 1;
+  for (let i = prefixes.length - 1; i >= 0; i -= 1) {
+    const ancestorPath = prefixes[i];
+    const step = resolveStepByPath(ancestorPath);
+    if (step?.type === "If") {
+      result.push({
+        depth,
+        path: ancestorPath,
+        label: describeIfPath(ancestorPath)
+      });
+      depth += 1;
+    }
+  }
+  return result;
+}
+
 function adjustContextForRemoval(targetCtx, srcPath) {
   if (!targetCtx || targetCtx.type !== 'branch') return targetCtx;
   const hostPath = Array.isArray(targetCtx.hostPath) ? targetCtx.hostPath : [];
@@ -2711,6 +2967,15 @@ function validateAndPrepare() {
       prepared.then = tArr.map((c, ci) => prepareChild(c, `Then ${ci + 1}`)).filter(Boolean);
       prepared.else = eArr.map((c, ci) => prepareChild(c, `Else ${ci + 1}`)).filter(Boolean);
     }
+    if (prepared.type === 'Restart') {
+      if (prepared.ifIndex === '' || prepared.ifIndex === null) {
+        delete prepared.ifIndex;
+      } else if (prepared.ifIndex !== undefined) {
+        const asNumber = Number(prepared.ifIndex);
+        if (Number.isFinite(asNumber)) prepared.ifIndex = asNumber;
+        else delete prepared.ifIndex;
+      }
+    }
     preparedSteps.push(prepared);
   });
 
@@ -2868,6 +3133,11 @@ function sanitizeFlowArray(value) {
       const elseArr = Array.isArray(step.else) ? step.else : Array.isArray(step.elseSteps) ? step.elseSteps : [];
       normalized.then = sanitizeFlowArray(thenArr);
       normalized.else = sanitizeFlowArray(elseArr);
+    }
+    if (step.type === 'Restart' && normalized.ifIndex !== undefined) {
+      const idx = Number(normalized.ifIndex);
+      if (Number.isFinite(idx)) normalized.ifIndex = idx;
+      else delete normalized.ifIndex;
     }
     sanitized.push(normalized);
   });
