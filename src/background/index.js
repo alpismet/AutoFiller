@@ -13,6 +13,8 @@ let offscreenCreationPromise = null;
 let activePicker = null;
 let isFlowRunning = false;
 let stopRequested = false;
+let gmailPromptCounter = 0;
+const gmailPromptWaiters = new Map();
 
 function getRestartOutcome(step) {
   if (typeof step !== "object" || !step) return null;
@@ -111,13 +113,24 @@ const STEP_SANITIZERS = {
     return out;
   },
   If(step) {
-    const mode = (typeof step.mode === 'string' && step.mode.toLowerCase() === 'visible') ? 'visible' : 'exists';
+    const modeRaw = typeof step.mode === 'string' ? step.mode.toLowerCase() : 'exists';
+    let mode = 'exists';
+    if (modeRaw === 'visible') mode = 'visible';
+    else if (modeRaw === 'text') mode = 'text';
     const selector = typeof step.selector === 'string' ? step.selector.trim() : '';
     if (!selector) return null;
     const t = Number(step.timeoutMs); const timeoutMs = Number.isFinite(t) && t >= 0 ? t : 0;
     const thenArr = sanitizeFlowArray(Array.isArray(step.then) ? step.then : []);
     const elseArr = sanitizeFlowArray(Array.isArray(step.else) ? step.else : []);
-    return { type: 'If', mode, selector, timeoutMs, then: thenArr, else: elseArr };
+    const allowedMatches = new Set(['any', 'contains', 'equals', 'startsWith', 'endsWith', 'empty', 'notEmpty']);
+    const matchRaw = typeof step.textMatch === 'string' ? step.textMatch : 'any';
+    const textMatch = allowedMatches.has(matchRaw) ? matchRaw : 'any';
+    let textValue = '';
+    if (!['any', 'empty', 'notEmpty'].includes(textMatch)) {
+      textValue = typeof step.textValue === 'string' ? step.textValue : '';
+    }
+    const textCaseSensitive = Boolean(step.textCaseSensitive);
+    return { type: 'If', mode, selector, timeoutMs, textMatch, textValue, textCaseSensitive, then: thenArr, else: elseArr };
   },
   
   WaitForEmailGmail(step) {
@@ -127,6 +140,15 @@ const STEP_SANITIZERS = {
     const p = Number(step.pollMs); out.pollMs = Number.isFinite(p) && p >= 500 ? p : 5000;
     out.variable = typeof step.variable === "string" && step.variable.trim() ? step.variable.trim() : "otp";
     return out;
+  },
+  Complete(step) {
+    const statusRaw = typeof step.status === 'string' ? step.status.toLowerCase() : 'success';
+    const status = statusRaw === 'failure' ? 'failure' : 'success';
+    const out = { type: 'Complete', status };
+    if (typeof step.message === 'string' && step.message.trim()) {
+      out.message = step.message.trim();
+    }
+    return out;
   }
 };
 
@@ -135,7 +157,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "RUN_FLOW") {
     (async () => {
       try {
-        console.log("[background] Starting flow...");
         if (isFlowRunning) {
           sendResponse({ ok: false, error: "Flow is already running" });
           return;
@@ -216,13 +237,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         } else if (step.type === 'If') {
           await ensureContentScript(targetTabId);
-          const res = await chrome.tabs.sendMessage(targetTabId, { type: 'RUN_STEP', step: { type: 'CheckElement', selector: step.selector, mode: step.mode || 'exists', timeoutMs: step.timeoutMs || 0 } });
+          const res = await chrome.tabs.sendMessage(targetTabId, { type: 'RUN_STEP', step: {
+            type: 'CheckElement',
+            selector: step.selector,
+            mode: step.mode || 'exists',
+            timeoutMs: step.timeoutMs || 0,
+            textMatch: step.textMatch || 'any',
+            textValue: step.textValue || '',
+            textCaseSensitive: Boolean(step.textCaseSensitive)
+          } });
           const cond = Boolean(res && (res.value === true || res.ok === true && res.value !== false));
           try { if (index >= 0) broadcastToOptions({ type: 'IF_RESULT', index, result: cond ? 'then' : 'else' }); } catch {}
           const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
           if (Array.isArray(branch) && branch.length) {
-            await runStepsInline(branch, targetTabId, { parentIndex: index, branchKey: cond ? 'then' : 'else', path: [index, (cond ? 'then' : 'else')] });
+            const out = await runStepsInline(branch, targetTabId, { parentIndex: index, branchKey: cond ? 'then' : 'else', path: [index, (cond ? 'then' : 'else')] });
+            if (out?.completedOutcome) {
+              if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: out.completedOutcome.outcome === 'failure' ? 'error' : 'success' });
+              sendResponse({ ok: true });
+              return;
+            }
           }
+        } else if (step.type === 'Complete') {
+          const outcome = (step.status || 'success') === 'failure' ? 'failure' : 'success';
+          const message = typeof step.message === 'string' ? step.message : '';
+          const status = outcome === 'failure' ? 'error' : 'success';
+          if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status });
+          broadcastToOptions({ type: 'FLOW_COMPLETE', outcome, message, index });
+          sendResponse({ ok: true });
+          return;
         } else if (step.type === "WaitForEmailGmail") {
           const res = await waitForEmailGmail(step);
           if (!res?.ok) throw new Error(res?.error || "step_failed");
@@ -373,6 +415,46 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
+
+  if (msg.type === "GMAIL_CONNECT_PROMPT_DECISION") {
+    (async () => {
+      const resolver = msg?.requestId ? gmailPromptWaiters.get(msg.requestId) : null;
+      if (!resolver) {
+        sendResponse({ ok: false, error: "invalid_request" });
+        return;
+      }
+      const action = msg.action;
+      if (action === 'cancel') {
+        gmailPromptWaiters.delete(msg.requestId);
+        resolver('cancel');
+        sendResponse({ ok: true });
+        return;
+      }
+      if (action === 'connect') {
+        try {
+          const { settings } = await chrome.storage.local.get(["settings"]);
+          const clientId = settings?.gmailClientId?.trim();
+          if (!clientId) {
+            sendResponse({ ok: false, error: "Gmail Client ID missing. Set it in Settings." });
+            return;
+          }
+          const res = await gmailConnect(clientId);
+          if (!res?.ok) {
+            sendResponse({ ok: false, error: res?.error || "gmail_connect_failed" });
+            return;
+          }
+          gmailPromptWaiters.delete(msg.requestId);
+          resolver('connected');
+          sendResponse({ ok: true, email: res.email });
+        } catch (err) {
+          sendResponse({ ok: false, error: err?.message || String(err) });
+        }
+        return;
+      }
+      sendResponse({ ok: false, error: "unknown_action" });
+    })();
+    return true;
+  }
 });
 
 // Native click fallback via Chrome DevTools Protocol (requires debugger permission)
@@ -452,10 +534,11 @@ async function runFlow(flow, tabId) {
   // iteration counter (only broadcast on completion)
   let iterCount = 0;
   let aborted = false;
+  let completedOutcome = null;
+  let completedCountsAsRun = false;
 
   for (let i = 0; i < flow.length; i++) {
     const step = flow[i];
-    console.log("→ Running step:", step.type);
     broadcastToOptions({ type: "FLOW_STATUS", index: i, status: "running" });
     try {
       if (stopRequested) throw new Error('aborted');
@@ -499,12 +582,26 @@ async function runFlow(flow, tabId) {
         }
       } else if (step.type === 'If') {
         await ensureContentScript(tabId);
-        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: { type: 'CheckElement', selector: step.selector, mode: step.mode || 'exists', timeoutMs: step.timeoutMs || 0 } });
+        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: {
+          type: 'CheckElement',
+          selector: step.selector,
+          mode: step.mode || 'exists',
+          timeoutMs: step.timeoutMs || 0,
+          textMatch: step.textMatch || 'any',
+          textValue: step.textValue || '',
+          textCaseSensitive: Boolean(step.textCaseSensitive)
+        } });
         const cond = Boolean(res && (res.value === true || (res.ok === true && res.value !== false)));
         try { broadcastToOptions({ type: 'IF_RESULT', index: i, result: cond ? 'then' : 'else' }); } catch {}
         const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
         if (Array.isArray(branch) && branch.length) {
           const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else', path: [i, (cond ? 'then' : 'else')] });
+          if (outcome?.completedOutcome) {
+            completedOutcome = outcome.completedOutcome;
+            completedCountsAsRun = outcome.completedOutcome.outcome === 'success';
+            broadcastToOptions({ type: 'FLOW_STATUS', index: i, status: outcome.completedOutcome.outcome === 'failure' ? 'error' : 'success' });
+            break;
+          }
           if (outcome && outcome.restartRequested) {
             if (outcome.targetDepth != null && outcome.targetDepth > 1) {
               outcome.targetDepth = outcome.targetDepth - 1;
@@ -529,6 +626,15 @@ async function runFlow(flow, tabId) {
             }
           }
         }
+      } else if (step.type === 'Complete') {
+        const outcome = (step.status || 'success') === 'failure' ? 'failure' : 'success';
+        const message = typeof step.message === 'string' ? step.message : '';
+        const status = outcome === 'failure' ? 'error' : 'success';
+        broadcastToOptions({ type: 'FLOW_STATUS', index: i, status });
+        broadcastToOptions({ type: 'FLOW_COMPLETE', outcome, message, index: i });
+        completedOutcome = { outcome, message };
+        completedCountsAsRun = outcome === 'success';
+        break;
       } else {
         await ensureContentScript(tabId);
         let res = null;
@@ -547,8 +653,17 @@ async function runFlow(flow, tabId) {
       aborted = true;
       break;
     }
+    if (completedOutcome) {
+      break;
+    }
     const delay = Math.max(0, Number(settings.stepDelayMs) || 0);
     if (delay) await wait(delay);
+  }
+  if (completedOutcome) {
+    if (completedCountsAsRun) {
+      iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
+    }
+    return;
   }
   if (!aborted) {
     iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
@@ -606,12 +721,28 @@ async function runStepsInline(steps, tabId, ctx) {
         }
       } else if (step.type === 'If') {
         await ensureContentScript(tabId);
-        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: { type: 'CheckElement', selector: step.selector, mode: step.mode || 'exists', timeoutMs: step.timeoutMs || 0 } });
+        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: {
+          type: 'CheckElement',
+          selector: step.selector,
+          mode: step.mode || 'exists',
+          timeoutMs: step.timeoutMs || 0,
+          textMatch: step.textMatch || 'any',
+          textValue: step.textValue || '',
+          textCaseSensitive: Boolean(step.textCaseSensitive)
+        } });
         const cond = Boolean(res && (res.value === true || res.ok === true && res.value !== false));
         const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
         if (Array.isArray(branch) && branch.length) {
-          const path = Array.isArray(ctx.path) ? ctx.path.concat(i, (cond ? 'then' : 'else')) : [ctx.parentIndex, ctx.branchKey || 'then', i, (cond ? 'then' : 'else')];
-          const outcome = await runStepsInline(branch, tabId, { ...ctx, path });
+          const branchPath = Array.isArray(ctx.path) ? ctx.path.concat(i, (cond ? 'then' : 'else')) : [ctx.parentIndex, ctx.branchKey || 'then', i, (cond ? 'then' : 'else')];
+          const outcome = await runStepsInline(branch, tabId, { ...ctx, path: branchPath });
+          if (outcome?.completedOutcome) {
+            if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
+              const selfPath = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
+              const status = outcome.completedOutcome.outcome === 'failure' ? 'error' : 'success';
+              try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path: selfPath, status }); } catch {}
+            }
+            return outcome;
+          }
           if (outcome && outcome.restartRequested) {
             if (outcome.targetDepth != null && outcome.targetDepth > 1) {
               return { restartRequested: true, targetDepth: outcome.targetDepth - 1, jumpToIfIndex: outcome.jumpToIfIndex };
@@ -623,6 +754,17 @@ async function runStepsInline(steps, tabId, ctx) {
             return outcome;
           }
         }
+      } else if (step.type === 'Complete') {
+        const outcome = (step.status || 'success') === 'failure' ? 'failure' : 'success';
+        const message = typeof step.message === 'string' ? step.message : '';
+        const status = outcome === 'failure' ? 'error' : 'success';
+        const path = Array.isArray(ctx?.path) ? ctx.path.concat(i) : (typeof ctx?.parentIndex === 'number' ? [ctx.parentIndex, ctx.branchKey || 'then', i] : null);
+        if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
+          const nestedPath = Array.isArray(path) ? path : [];
+          try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path: nestedPath, status }); } catch {}
+        }
+        broadcastToOptions({ type: 'FLOW_COMPLETE', outcome, message, index: typeof ctx?.parentIndex === 'number' ? ctx.parentIndex : null, path });
+        return { completedOutcome: { outcome, message } };
       } else {
         await ensureContentScript(tabId);
         let res = null;
@@ -679,17 +821,58 @@ async function gmailConnect(clientId) {
   return { ok: true, email };
 }
 
+function requestGmailConnectPrompt(reason) {
+  return new Promise((resolve) => {
+    const requestId = `gmail_prompt_${Date.now()}_${gmailPromptCounter += 1}`;
+    gmailPromptWaiters.set(requestId, resolve);
+    broadcastToOptions({ type: 'GMAIL_CONNECT_REQUIRED', requestId, reason });
+    setTimeout(() => {
+      if (!gmailPromptWaiters.has(requestId)) return;
+      gmailPromptWaiters.delete(requestId);
+      resolve('timeout');
+    }, 60000);
+  });
+}
+
+async function promptForGmailConnection(reason) {
+  const decision = await requestGmailConnectPrompt(reason);
+  if (decision !== 'connected') {
+    let message;
+    if (decision === 'cancel') message = 'Gmail connection cancelled by user.';
+    else if (decision === 'timeout') message = 'Gmail connection request timed out.';
+    else message = reason === 'expired' ? 'Gmail token expired. Reconnect.' : 'Gmail not connected';
+    const err = new Error(message);
+    err.code = decision === 'cancel' ? 'cancelled' : decision === 'timeout' ? 'timeout' : reason;
+    throw err;
+  }
+  return ensureGmailToken();
+}
+
 async function ensureGmailToken() {
   const { settings } = await chrome.storage.local.get(["settings"]);
   const conn = settings?.gmailConnection;
-  if (!conn?.access_token) throw new Error("Gmail not connected");
+  if (!conn?.access_token) {
+    const err = new Error("Gmail not connected");
+    err.code = 'not_connected';
+    throw err;
+  }
   if (Date.now() < (conn.expires_at || 0)) return conn.access_token;
-  // token expired: require reconnect (or implement refresh if using code flow)
-  throw new Error("Gmail token expired. Reconnect.");
+  const err = new Error("Gmail token expired. Reconnect.");
+  err.code = 'expired';
+  throw err;
 }
 
 async function waitForEmailGmail(step) {
-  const token = await ensureGmailToken();
+  let token;
+  try {
+    token = await ensureGmailToken();
+  } catch (err) {
+    if (err?.code === 'not_connected' || err?.code === 'expired') {
+      token = await promptForGmailConnection(err.code);
+    } else {
+      throw err;
+    }
+  }
   const timeoutMs = Number(step.timeoutMs) || 120000;
   const pollMs = Number(step.pollMs) || 5000;
   const until = Date.now() + timeoutMs;
@@ -871,8 +1054,10 @@ async function saveVariable(name, value) {
 
 function broadcastToOptions(payload) {
   try {
-    // Fire-and-forget without a callback to avoid Unchecked runtime.lastError
-    chrome.runtime.sendMessage(payload);
+    const maybePromise = chrome.runtime.sendMessage(payload);
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      maybePromise.catch(() => {});
+    }
   } catch {}
   try { mirrorUiStateToStorage(payload); } catch {}
 }

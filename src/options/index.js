@@ -46,10 +46,22 @@ const STEP_LIBRARY = [
     fields: [
       { key: "mode", label: "Condition", type: "select", required: true, options: [
         { value: "exists", label: "Element exists" },
-        { value: "visible", label: "Element visible" }
+        { value: "visible", label: "Element visible" },
+        { value: "text", label: "Text matches" }
       ], default: "exists" },
       { key: "selector", label: "Target selector", type: "text", required: true, placeholder: "#panel, .modal, [data-open]", supportsPicker: true },
-      { key: "timeoutMs", label: "Wait up to (ms)", type: "number", min: 0, step: 100, default: 0 }
+      { key: "timeoutMs", label: "Wait up to (ms)", type: "number", min: 0, step: 100, default: 0 },
+      { key: "textMatch", label: "Text condition", type: "select", options: [
+        { value: "any", label: "Ignore text" },
+        { value: "contains", label: "Contains" },
+        { value: "equals", label: "Equals" },
+        { value: "startsWith", label: "Starts with" },
+        { value: "endsWith", label: "Ends with" },
+        { value: "empty", label: "Is empty" },
+        { value: "notEmpty", label: "Is not empty" }
+      ], default: "any" },
+      { key: "textValue", label: "Text value", type: "text", placeholder: "Success" },
+      { key: "textCaseSensitive", label: "Case sensitive", type: "checkbox", default: false }
     ]
   },
   {
@@ -130,6 +142,18 @@ const STEP_LIBRARY = [
       { key: "pollMs", label: "Poll interval (ms)", type: "number", placeholder: "5000", min: 500, step: 500, default: 5000 },
       { key: "variable", label: "Save as variable", type: "text", required: true, placeholder: "otp", default: "otp" }
     ]
+  },
+  {
+    type: "Complete",
+    label: "Complete flow",
+    description: "Stop execution immediately and mark the flow outcome.",
+    fields: [
+      { key: "status", label: "Outcome", type: "select", required: true, options: [
+        { value: "success", label: "Success" },
+        { value: "failure", label: "Failure" }
+      ], default: "success" },
+      { key: "message", label: "Message (optional)", type: "text", placeholder: "Optional note" }
+    ]
   }
 ];
 
@@ -175,7 +199,8 @@ const els = {
   moreMenu: document.getElementById("moreMenu"),
   menuReset: document.getElementById("menuReset"),
   menuExport: document.getElementById("menuExport"),
-  menuImport: document.getElementById("menuImport")
+  menuImport: document.getElementById("menuImport"),
+  menuClear: document.getElementById("menuClear")
 };
 
 const state = {
@@ -194,10 +219,76 @@ const state = {
   runCount: 0,
   savedFlows: [],
   lastRunIncremented: false,
-  stopSuppressUntil: 0
+  stopSuppressUntil: 0,
+  inlineInsertActive: false
 };
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
+
+function isInlineInsertComboActive(event) {
+  if (!event) return false;
+  if (typeof event.getModifierState === 'function') {
+    return event.getModifierState('Shift') && (event.getModifierState('Control') || event.getModifierState('Meta'));
+  }
+  return event.shiftKey && (event.ctrlKey || event.metaKey);
+}
+
+function captureViewportAnchor() {
+  const info = { scrollX: window.scrollX, scrollY: window.scrollY };
+  const cx = Math.max(0, Math.min(window.innerWidth - 1, Math.floor(window.innerWidth / 2)));
+  const cy = Math.max(0, Math.min(window.innerHeight - 1, Math.floor(window.innerHeight / 2)));
+  let el = document.elementFromPoint(cx, cy);
+  while (el && !(el instanceof HTMLElement && el.classList.contains('step-card'))) {
+    el = el.parentElement;
+  }
+  if (el && el.dataset?.path) {
+    const rect = el.getBoundingClientRect();
+    info.path = el.dataset.path;
+    info.offset = rect.top;
+  }
+  return info;
+}
+
+function restoreViewportAnchor(anchor) {
+  if (!anchor) return;
+  const { path, offset, scrollX, scrollY } = anchor;
+  if (path) {
+    const card = Array.from(document.querySelectorAll('.step-card')).find((el) => el.dataset?.path === path);
+    if (card) {
+      const rect = card.getBoundingClientRect();
+      const targetTop = typeof offset === 'number' ? offset : rect.top;
+      const delta = rect.top - targetTop;
+      window.scrollTo(scrollX, scrollY + delta);
+      return;
+    }
+  }
+  window.scrollTo(scrollX, scrollY);
+}
+
+function setInlineInsertActive(active) {
+  const desired = Boolean(active) && !state.pendingPicker;
+  if (state.inlineInsertActive === desired) return;
+  const anchor = captureViewportAnchor();
+  state.inlineInsertActive = desired;
+  render();
+  restoreViewportAnchor(anchor);
+}
+
+const gmailPromptUI = {
+  el: null,
+  requestId: null,
+  messageEl: null,
+  errorEl: null,
+  connectBtn: null,
+  cancelBtn: null,
+  timeoutId: null,
+  setLoading(loading) {
+    if (!this.connectBtn || !this.cancelBtn) return;
+    this.connectBtn.disabled = loading;
+    this.cancelBtn.disabled = loading;
+    this.connectBtn.textContent = loading ? 'Bağlanıyor...' : 'Bağlan';
+  }
+};
 
 // Modern drag & drop state (supports nested If branches)
 const DND_MIME = "application/x-autofiller-step";
@@ -216,6 +307,185 @@ const dndState = {
   targetIndex: -1,
   targetValid: false
 };
+
+function ensureGmailPromptElement() {
+  if (gmailPromptUI.el) return gmailPromptUI.el;
+  const overlay = document.createElement('div');
+  overlay.id = 'gmail-connect-overlay';
+  Object.assign(overlay.style, {
+    position: 'fixed',
+    inset: '0',
+    background: 'rgba(15,23,42,0.55)',
+    backdropFilter: 'blur(1.5px)',
+    display: 'none',
+    placeItems: 'center',
+    padding: '24px',
+    zIndex: '2147483647'
+  });
+
+  const panel = document.createElement('div');
+  Object.assign(panel.style, {
+    background: '#0f172a',
+    color: '#e2e8f0',
+    border: '1px solid rgba(148,163,184,0.3)',
+    borderRadius: '12px',
+    boxShadow: '0 20px 55px rgba(15,23,42,0.45)',
+    padding: '24px',
+    width: 'min(360px, 90vw)',
+    display: 'grid',
+    gap: '16px'
+  });
+
+  const title = document.createElement('h2');
+  title.textContent = 'Gmail bağlantısı gerekli';
+  Object.assign(title.style, {
+    margin: '0',
+    fontSize: '18px',
+    fontWeight: '600'
+  });
+
+  const message = document.createElement('p');
+  Object.assign(message.style, {
+    margin: '0',
+    fontSize: '14px',
+    lineHeight: '1.5'
+  });
+
+  const error = document.createElement('p');
+  Object.assign(error.style, {
+    margin: '0',
+    fontSize: '13px',
+    color: '#f87171',
+    minHeight: '16px'
+  });
+
+  const actions = document.createElement('div');
+  Object.assign(actions.style, {
+    display: 'flex',
+    gap: '12px',
+    justifyContent: 'flex-end'
+  });
+
+  const cancelBtn = document.createElement('button'); cancelBtn.type = 'button'; cancelBtn.textContent = 'Kapat';
+  Object.assign(cancelBtn.style, {
+    padding: '8px 16px',
+    borderRadius: '8px',
+    border: '1px solid rgba(148,163,184,0.4)',
+    background: 'transparent',
+    color: '#e2e8f0',
+    cursor: 'pointer'
+  });
+
+  const connectBtn = document.createElement('button'); connectBtn.type = 'button'; connectBtn.textContent = 'Bağlan';
+  Object.assign(connectBtn.style, {
+    padding: '8px 16px',
+    borderRadius: '8px',
+    border: 'none',
+    background: 'linear-gradient(135deg, #2563eb, #4f46e5)',
+    color: '#f8fafc',
+    fontWeight: '600',
+    cursor: 'pointer'
+  });
+
+  actions.appendChild(cancelBtn);
+  actions.appendChild(connectBtn);
+  panel.appendChild(title);
+  panel.appendChild(message);
+  panel.appendChild(error);
+  panel.appendChild(actions);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) {
+      if (!gmailPromptUI.requestId) {
+        overlay.style.display = 'none';
+      }
+    }
+  });
+
+  cancelBtn.addEventListener('click', async () => {
+    if (!gmailPromptUI.requestId) {
+      hideGmailConnectPrompt();
+      return;
+    }
+    gmailPromptUI.setLoading(true);
+    try { await chrome.runtime.sendMessage({ type: 'GMAIL_CONNECT_PROMPT_DECISION', action: 'cancel', requestId: gmailPromptUI.requestId }); } catch {}
+    hideGmailConnectPrompt();
+    showStatus('Gmail bağlantısı iptal edildi.');
+  });
+
+  connectBtn.addEventListener('click', async () => {
+    if (!gmailPromptUI.requestId) {
+      hideGmailConnectPrompt();
+      return;
+    }
+    gmailPromptUI.errorEl.textContent = '';
+    gmailPromptUI.setLoading(true);
+    try {
+      const res = await chrome.runtime.sendMessage({ type: 'GMAIL_CONNECT_PROMPT_DECISION', action: 'connect', requestId: gmailPromptUI.requestId });
+      if (!res?.ok) {
+        gmailPromptUI.errorEl.textContent = res?.error || 'Bağlantı kurulamadı.';
+        gmailPromptUI.setLoading(false);
+        return;
+      }
+      await refreshGmailSettingsFromStorage();
+      hideGmailConnectPrompt();
+      showStatus('Gmail connected.');
+    } catch (err) {
+      gmailPromptUI.errorEl.textContent = err?.message || String(err);
+      gmailPromptUI.setLoading(false);
+    }
+  });
+
+  gmailPromptUI.el = overlay;
+  gmailPromptUI.messageEl = message;
+  gmailPromptUI.errorEl = error;
+  gmailPromptUI.connectBtn = connectBtn;
+  gmailPromptUI.cancelBtn = cancelBtn;
+  gmailPromptUI.timeoutId = null;
+  return overlay;
+}
+
+function showGmailConnectPrompt(reason, requestId) {
+  ensureGmailPromptElement();
+  const overlay = gmailPromptUI.el;
+  const reasonText = reason === 'expired'
+    ? 'Gmail bağlantı süresi dolmuş. Devam etmek için hesabınızı yeniden bağlayın.'
+    : 'Bu adımı çalıştırmak için Gmail bağlantısı gerekiyor. Bağlanmak ister misiniz?';
+  gmailPromptUI.requestId = requestId;
+  gmailPromptUI.messageEl.textContent = reasonText;
+  gmailPromptUI.errorEl.textContent = '';
+  gmailPromptUI.setLoading(false);
+  if (gmailPromptUI.timeoutId) {
+    clearTimeout(gmailPromptUI.timeoutId);
+    gmailPromptUI.timeoutId = null;
+  }
+  gmailPromptUI.timeoutId = window.setTimeout(() => {
+    if (gmailPromptUI.requestId === requestId) {
+      try {
+        const maybe = chrome.runtime.sendMessage({ type: 'GMAIL_CONNECT_PROMPT_DECISION', action: 'cancel', requestId });
+        if (maybe && typeof maybe.catch === 'function') maybe.catch(() => {});
+      } catch {}
+      hideGmailConnectPrompt();
+      showStatus('Gmail connection request timed out.');
+    }
+  }, 60000);
+  overlay.style.display = 'grid';
+}
+
+function hideGmailConnectPrompt() {
+  if (gmailPromptUI.timeoutId) {
+    clearTimeout(gmailPromptUI.timeoutId);
+    gmailPromptUI.timeoutId = null;
+  }
+  if (gmailPromptUI.el) {
+    gmailPromptUI.el.style.display = 'none';
+  }
+  gmailPromptUI.setLoading(false);
+  if (gmailPromptUI.errorEl) gmailPromptUI.errorEl.textContent = '';
+  gmailPromptUI.requestId = null;
+}
 let dndHandlersBound = false;
 
 const DND_DEBUG = (() => {
@@ -330,12 +600,12 @@ chrome.runtime.onMessage.addListener((msg) => {
     handleFlowNestedStatus(msg);
     return;
   }
-  if (msg.type === "IF_RESULT") {
-    handleIfResult(msg);
+  if (msg.type === "FLOW_COMPLETE") {
+    handleFlowComplete(msg);
     return;
   }
-  if (msg.type === "FLOW_ITER") {
-    handleFlowIter(msg);
+  if (msg.type === "IF_RESULT") {
+    handleIfResult(msg);
     return;
   }
   if (msg.type === "WAIT_COUNTDOWN") {
@@ -344,6 +614,10 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   if (msg.type === "WAIT_NESTED_COUNTDOWN") {
     handleWaitNestedCountdown(msg);
+    return;
+  }
+  if (msg.type === "GMAIL_CONNECT_REQUIRED") {
+    showGmailConnectPrompt(msg.reason || 'not_connected', msg.requestId);
     return;
   }
   if (msg.type === "FLOW_ABORT") {
@@ -388,10 +662,24 @@ async function init() {
 
 function wireEvents() {
   els.addStep?.addEventListener("click", () => {
-    addStep();
-    render();
-    setDirty(true);
+    if (addStep()) {
+      render();
+      setDirty(true);
+    }
   });
+
+  const inlineKeyDown = (event) => {
+    if (event.repeat && state.inlineInsertActive) return;
+    if (!isInlineInsertComboActive(event)) return;
+    setInlineInsertActive(true);
+  };
+  const inlineKeyUp = (event) => {
+    if (isInlineInsertComboActive(event)) return;
+    setInlineInsertActive(false);
+  };
+  document.addEventListener('keydown', inlineKeyDown);
+  document.addEventListener('keyup', inlineKeyUp);
+  window.addEventListener('blur', () => setInlineInsertActive(false));
 
   els.saveFlow?.addEventListener("click", async () => {
     const saved = await persistFlow();
@@ -477,6 +765,19 @@ function wireEvents() {
   els.menuReset?.addEventListener("click", () => { els.moreMenu?.classList.add("hidden"); els.loadDefault?.click(); });
   els.menuExport?.addEventListener("click", () => { els.moreMenu?.classList.add("hidden"); exportFlow(); });
   els.menuImport?.addEventListener("click", () => { els.moreMenu?.classList.add("hidden"); els.importFlow?.click(); });
+  els.menuClear?.addEventListener("click", () => {
+    els.moreMenu?.classList.add("hidden");
+    if (!confirm("Clear all steps and start with an empty flow?")) return;
+    state.steps = [];
+    state.stepStatuses = [];
+    state.nestedStatuses = {};
+    state.ifResults = {};
+    state.waitCountdowns = {};
+    state.nestedWaitCountdowns = {};
+    setDirty(true);
+    render();
+    showStatus("Flow cleared. Add steps to start building.");
+  });
 
   // removed duplicate message listener; handled centrally
 
@@ -528,7 +829,8 @@ function wireEvents() {
       if (!clientId) { alert("Enter Gmail OAuth Client ID in Settings"); return; }
       const res = await chrome.runtime.sendMessage({ type: "GMAIL_CONNECT", clientId });
       if (!res?.ok) { alert("Gmail connect failed: " + (res?.error || "unknown")); return; }
-      els.gmailStatus.textContent = `Connected as ${res.email || 'account'}`;
+      await refreshGmailSettingsFromStorage();
+      hideGmailConnectPrompt();
       showStatus("Gmail connected.");
     } catch (err) {
       console.error("[options] Gmail connect error:", err);
@@ -614,17 +916,7 @@ function render() {
   if (els.selectorWaitMs) els.selectorWaitMs.value = String(state.settings.selectorWaitMs ?? DEFAULT_SETTINGS.selectorWaitMs);
   if (els.useNativeClick) els.useNativeClick.checked = Boolean(state.settings.useNativeClick ?? DEFAULT_SETTINGS.useNativeClick);
   if (els.gmailClientId) els.gmailClientId.value = String(state.settings.gmailClientId ?? "");
-  if (els.gmailStatus) {
-    const conn = state.settings.gmailConnection?.email;
-    if (conn) {
-      const text = `Connected as ${conn}`;
-      els.gmailStatus.textContent = text;
-      els.gmailStatus.title = text;
-    } else {
-      els.gmailStatus.textContent = "Not connected";
-      els.gmailStatus.title = "Not connected";
-    }
-  }
+  updateGmailStatusLabel();
   updateEmptyState();
   setControlsDisabled(Boolean(state.pendingPicker));
   updateControlsForTab();
@@ -642,11 +934,39 @@ function renderSteps() {
   if (!container) return;
   container.innerHTML = "";
   markListDroppable(container, [], 'root');
+  const showInlineSlots = Boolean(state.inlineInsertActive);
+  if (showInlineSlots) {
+    container.appendChild(createInlineAddSlot(0));
+  }
 
   state.steps.forEach((step, index) => {
     const card = createStepCard(step, index);
     container.appendChild(card);
+    if (showInlineSlots) {
+      container.appendChild(createInlineAddSlot(index + 1));
+    }
   });
+
+  if (state.steps.length === 0 && !showInlineSlots) {
+    // nothing extra; empty state handles messaging
+  }
+}
+
+function createInlineAddSlot(position) {
+  const slot = document.createElement('div');
+  slot.className = 'inline-add-slot';
+  slot.dataset.insertIndex = String(position);
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'inline-add-btn';
+  btn.textContent = '＋ Add Step';
+  btn.addEventListener('click', () => {
+    if (!insertStepAt(position)) return;
+    render();
+    setDirty(true);
+  });
+  slot.appendChild(btn);
+  return slot;
 }
 
 function createStepCard(step, index) {
@@ -797,6 +1117,38 @@ async function runSingleStep(index) {
 function buildFields(container, schema, step, stepIndex, ctx = {}) {
   container.innerHTML = "";
   if (!schema) return;
+  const ifTextRefs = schema.type === 'If' ? { modeWrap: null, valueWrap: null, valueInput: null, caseWrap: null } : null;
+  const applyIfTextVisibility = () => {
+    if (!ifTextRefs) return;
+    const isTextMode = (step.mode || 'exists') === 'text';
+    if (isTextMode && (!step.textMatch || step.textMatch === 'any')) {
+      step.textMatch = 'contains';
+    }
+    const match = typeof step.textMatch === 'string' ? step.textMatch : 'any';
+    const needsValue = isTextMode && !['any', 'empty', 'notEmpty'].includes(match);
+
+    if (ifTextRefs.modeWrap) ifTextRefs.modeWrap.style.display = isTextMode ? '' : 'none';
+    if (ifTextRefs.caseWrap) ifTextRefs.caseWrap.style.display = isTextMode ? '' : 'none';
+    if (ifTextRefs.valueWrap) ifTextRefs.valueWrap.style.display = needsValue ? '' : 'none';
+    if (ifTextRefs.valueInput) {
+      ifTextRefs.valueInput.required = needsValue;
+      if (!needsValue && typeof ifTextRefs.valueInput.setCustomValidity === 'function') {
+        ifTextRefs.valueInput.setCustomValidity('');
+      }
+      if (!needsValue && ifTextRefs.valueInput.value !== '') {
+        ifTextRefs.valueInput.value = '';
+      }
+    }
+
+    if (!needsValue) {
+      step.textValue = '';
+    }
+    if (!isTextMode) {
+      step.textCaseSensitive = false;
+      step.textMatch = 'any';
+      step.textValue = '';
+    }
+  };
 
   schema.fields.forEach((field) => {
     // Dynamic options for Restart.ifIndex and mode-dependent visibility
@@ -1132,6 +1484,17 @@ function buildFields(container, schema, step, stepIndex, ctx = {}) {
         const rawValue = event.target.value;
         setDirty(true, { silent: true });
         updateFieldValue(stepIndex, field, rawValue);
+        if (schema.type === 'If' && field.key === 'mode') {
+          if (rawValue === 'text') {
+            if (!step.textMatch || step.textMatch === 'any') step.textMatch = 'contains';
+          } else {
+            step.textMatch = 'any';
+            step.textValue = '';
+            step.textCaseSensitive = false;
+          }
+          render();
+          return;
+        }
         // If changing Restart mode, re-render to show If select
         if (schema.type === 'Restart' && field.key === 'mode') {
           render();
@@ -1249,7 +1612,20 @@ function buildFields(container, schema, step, stepIndex, ctx = {}) {
       fieldWrapper.appendChild(inputHost);
     }
     container.appendChild(fieldWrapper);
+    if (ifTextRefs) {
+      if (field.key === 'textMatch') {
+        ifTextRefs.modeInput = input;
+        ifTextRefs.modeWrap = fieldWrapper;
+        input.addEventListener('change', applyIfTextVisibility);
+      } else if (field.key === 'textValue') {
+        ifTextRefs.valueWrap = fieldWrapper;
+        ifTextRefs.valueInput = input;
+      } else if (field.key === 'textCaseSensitive') {
+        ifTextRefs.caseWrap = fieldWrapper;
+      }
+    }
   });
+  applyIfTextVisibility();
 }
 
 function renderIfBranches(container, step, stepIndex) {
@@ -1373,6 +1749,38 @@ function buildFieldsNested(container, schema, step, ctx) {
     return arr[ctx.childIndex] || null;
   };
   const stepPath = Array.isArray(ctx.path) ? ctx.path.slice() : [ctx.parentIndex, ctx.branchKey, ctx.childIndex];
+  const ifTextRefs = schema.type === 'If' ? { modeWrap: null, valueWrap: null, valueInput: null, caseWrap: null } : null;
+  const applyIfTextVisibility = () => {
+    if (!ifTextRefs) return;
+    const current = stepRef() || step;
+    const isTextMode = (current?.mode || 'exists') === 'text';
+    if (isTextMode && current && (!current.textMatch || current.textMatch === 'any')) {
+      current.textMatch = 'contains';
+    }
+    const match = typeof current?.textMatch === 'string' ? current.textMatch : 'any';
+    const needsValue = isTextMode && !['any', 'empty', 'notEmpty'].includes(match);
+
+    if (ifTextRefs.modeWrap) ifTextRefs.modeWrap.style.display = isTextMode ? '' : 'none';
+    if (ifTextRefs.caseWrap) ifTextRefs.caseWrap.style.display = isTextMode ? '' : 'none';
+    if (ifTextRefs.valueWrap) ifTextRefs.valueWrap.style.display = needsValue ? '' : 'none';
+    if (ifTextRefs.valueInput) {
+      ifTextRefs.valueInput.required = needsValue;
+      if (!needsValue && typeof ifTextRefs.valueInput.setCustomValidity === 'function') {
+        ifTextRefs.valueInput.setCustomValidity('');
+      }
+      if (!needsValue && ifTextRefs.valueInput.value !== '') {
+        ifTextRefs.valueInput.value = '';
+      }
+    }
+    if (current) {
+      if (!needsValue) current.textValue = '';
+      if (!isTextMode) {
+        current.textCaseSensitive = false;
+        current.textMatch = 'any';
+        current.textValue = '';
+      }
+    }
+  };
 
   schema.fields.forEach((field) => {
     if (schema.type === 'Restart' && field.key === 'ifIndex') {
@@ -1558,7 +1966,26 @@ function buildFieldsNested(container, schema, step, ctx) {
     else if (field.type === "select") { if (existing !== undefined && existing !== null) input.value = String(existing); else if (field.default !== undefined) input.value = String(field.default); }
     else { if (existing !== undefined && existing !== null) input.value = String(existing); else if (field.default !== undefined) input.value = String(field.default); }
     if (field.type === "checkbox") { input.addEventListener("change", (e) => { setDirty(true, { silent: true }); updateNestedFieldValue(ctx.parentIndex, ctx.branchKey, ctx.childIndex, field, Boolean(e.target.checked)); }); }
-    else if (field.type === "select") { input.addEventListener("change", (e) => { setDirty(true, { silent: true }); updateNestedFieldValue(ctx.parentIndex, ctx.branchKey, ctx.childIndex, field, e.target.value); }); }
+    else if (field.type === "select") {
+      input.addEventListener("change", (e) => {
+        const val = e.target.value;
+        setDirty(true, { silent: true });
+        updateNestedFieldValue(ctx.parentIndex, ctx.branchKey, ctx.childIndex, field, val);
+        if (schema.type === 'If' && field.key === 'mode') {
+          const target = stepRef();
+          if (target) {
+            if (val === 'text') {
+              if (!target.textMatch || target.textMatch === 'any') target.textMatch = 'contains';
+            } else {
+              target.textMatch = 'any';
+              target.textValue = '';
+              target.textCaseSensitive = false;
+            }
+          }
+          render();
+        }
+      });
+    }
     else { input.addEventListener("input", (e) => { setDirty(true, { silent: true }); updateNestedFieldValue(ctx.parentIndex, ctx.branchKey, ctx.childIndex, field, e.target.value); }); }
 
     let inputHost = input;
@@ -1609,7 +2036,20 @@ function buildFieldsNested(container, schema, step, ctx) {
       fieldWrapper.appendChild(label); fieldWrapper.appendChild(inputHost);
     }
     container.appendChild(fieldWrapper);
+    if (ifTextRefs) {
+      if (field.key === 'textMatch') {
+        ifTextRefs.modeInput = input;
+        ifTextRefs.modeWrap = fieldWrapper;
+        input.addEventListener('change', applyIfTextVisibility);
+      } else if (field.key === 'textValue') {
+        ifTextRefs.valueWrap = fieldWrapper;
+        ifTextRefs.valueInput = input;
+      } else if (field.key === 'textCaseSensitive') {
+        ifTextRefs.caseWrap = fieldWrapper;
+      }
+    }
   });
+  applyIfTextVisibility();
 
   // If this nested step is an If, render its Then/Else branches as deep-nested lists
   if (schema.type === 'If') {
@@ -1751,6 +2191,36 @@ function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childInd
   const deepPath = Array.isArray(pathBase) ? [...pathBase, nestedKey, childIndex] : null;
   const pickerCtx = deepPath ? { path: deepPath } : null;
   const stepPath = Array.isArray(deepPath) ? deepPath.slice() : [];
+  const ifTextRefs = schema.type === 'If' ? { modeWrap: null, valueWrap: null, valueInput: null, caseWrap: null } : null;
+  const applyIfTextVisibility = () => {
+    if (!ifTextRefs) return;
+    const isTextMode = (step.mode || 'exists') === 'text';
+    if (isTextMode && (!step.textMatch || step.textMatch === 'any')) {
+      step.textMatch = 'contains';
+    }
+    const match = typeof step.textMatch === 'string' ? step.textMatch : 'any';
+    const needsValue = isTextMode && !['any', 'empty', 'notEmpty'].includes(match);
+
+    if (ifTextRefs.modeWrap) ifTextRefs.modeWrap.style.display = isTextMode ? '' : 'none';
+    if (ifTextRefs.caseWrap) ifTextRefs.caseWrap.style.display = isTextMode ? '' : 'none';
+    if (ifTextRefs.valueWrap) ifTextRefs.valueWrap.style.display = needsValue ? '' : 'none';
+    if (ifTextRefs.valueInput) {
+      ifTextRefs.valueInput.required = needsValue;
+      if (!needsValue && typeof ifTextRefs.valueInput.setCustomValidity === 'function') {
+        ifTextRefs.valueInput.setCustomValidity('');
+      }
+      if (!needsValue && ifTextRefs.valueInput.value !== '') {
+        ifTextRefs.valueInput.value = '';
+      }
+    }
+
+    if (!needsValue) step.textValue = '';
+    if (!isTextMode && step.textCaseSensitive) {
+      step.textCaseSensitive = false;
+      step.textMatch = 'any';
+      step.textValue = '';
+    }
+  };
   schema.fields.forEach((field) => {
     if (schema.type === 'Restart' && field.key === 'ifIndex') {
       const ancestors = collectAncestorIfs(stepPath);
@@ -1859,9 +2329,27 @@ function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childInd
     if (field.type === 'checkbox') { if (existing !== undefined && existing !== null) input.checked = Boolean(existing); else if (field.default !== undefined) input.checked = Boolean(field.default); }
     else if (field.type === 'select') { if (existing !== undefined && existing !== null) input.value = String(existing); else if (field.default !== undefined) input.value = String(field.default); }
     else { if (existing !== undefined && existing !== null) input.value = String(existing); else if (field.default !== undefined) input.value = String(field.default); }
-    if (field.type === 'checkbox') { input.addEventListener('change', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, Boolean(e.target.checked)); }); }
-    else if (field.type === 'select') { input.addEventListener('change', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, e.target.value); }); }
-    else { input.addEventListener('input', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, e.target.value); }); }
+    if (field.type === 'checkbox') {
+      input.addEventListener('change', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, Boolean(e.target.checked)); });
+    } else if (field.type === 'select') {
+      input.addEventListener('change', (e) => {
+        const val = e.target.value;
+        setDirty(true, { silent: true });
+        updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, val);
+        if (schema.type === 'If' && field.key === 'mode') {
+          if (val === 'text') {
+            if (!step.textMatch || step.textMatch === 'any') step.textMatch = 'contains';
+          } else {
+            step.textMatch = 'any';
+            step.textValue = '';
+            step.textCaseSensitive = false;
+          }
+          render();
+        }
+      });
+    } else {
+      input.addEventListener('input', (e) => { setDirty(true, { silent: true }); updateDeepNestedFieldValue(parentCtx, nestedKey, childIndex, field, e.target.value); });
+    }
 
     let inputHost = input;
     if (field.supportsPicker && pickerCtx) {
@@ -1890,7 +2378,20 @@ function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childInd
 
     wrap.appendChild(inputHost);
     container.appendChild(wrap);
+    if (ifTextRefs) {
+      if (field.key === 'textMatch') {
+        ifTextRefs.modeInput = input;
+        ifTextRefs.modeWrap = wrap;
+        input.addEventListener('change', applyIfTextVisibility);
+      } else if (field.key === 'textValue') {
+        ifTextRefs.valueWrap = wrap;
+        ifTextRefs.valueInput = input;
+      } else if (field.key === 'textCaseSensitive') {
+        ifTextRefs.caseWrap = wrap;
+      }
+    }
   });
+  applyIfTextVisibility();
 
   // If this deep-nested step is an If, render its own Then/Else recursively
   if (schema.type === 'If') {
@@ -2030,16 +2531,57 @@ function updateNestedFieldValue(parentIndex, branchKey, index, field, rawValue) 
   if (!arr[index]) return; arr[index][field.key] = rawValue;
 }
 
-function addStep(type = STEP_LIBRARY[0].type) {
+function shiftIndexedMap(map, pivot, delta) {
+  if (!map) return {};
+  const next = {};
+  Object.keys(map).forEach((key) => {
+    const num = Number(key);
+    if (Number.isFinite(num)) {
+      const newKey = num >= pivot ? num + delta : num;
+      next[newKey] = map[key];
+    } else {
+      next[key] = map[key];
+    }
+  });
+  return next;
+}
+
+function shiftNestedMap(map, pivot, delta) {
+  if (!map) return {};
+  const next = {};
+  Object.keys(map).forEach((key) => {
+    const parts = key.split('|');
+    const first = Number(parts[0]);
+    if (Number.isFinite(first) && first >= pivot) {
+      parts[0] = String(first + delta);
+      next[parts.join('|')] = map[key];
+    } else {
+      next[key] = map[key];
+    }
+  });
+  return next;
+}
+
+function insertStepAt(index, type = STEP_LIBRARY[0].type) {
   if (state.pendingPicker) {
     alert("Finish the element picker first.");
-    return;
+    return false;
   }
   const schema = STEP_LIBRARY_MAP.get(type) || STEP_LIBRARY[0];
   const newStep = createStepFromSchema(schema);
-  state.steps.push(newStep);
-  state.stepStatuses.push("idle");
+  const insertIndex = Math.max(0, Math.min(Number(index) || 0, state.steps.length));
+  state.steps.splice(insertIndex, 0, newStep);
+  state.stepStatuses.splice(insertIndex, 0, "idle");
+  state.ifResults = shiftIndexedMap(state.ifResults, insertIndex, 1);
+  state.waitCountdowns = shiftIndexedMap(state.waitCountdowns, insertIndex, 1);
+  state.nestedStatuses = shiftNestedMap(state.nestedStatuses, insertIndex, 1);
+  state.nestedWaitCountdowns = shiftNestedMap(state.nestedWaitCountdowns, insertIndex, 1);
   updateEmptyState();
+  return true;
+}
+
+function addStep(type = STEP_LIBRARY[0].type) {
+  return insertStepAt(state.steps.length, type);
 }
 
 function deleteStep(index) {
@@ -2660,6 +3202,7 @@ function resetFlowStatuses() {
   state.ifResults = {};
   state.waitCountdowns = {};
   state.nestedWaitCountdowns = {};
+  state.lastRunIncremented = false;
 }
 
 function applyMoveStep(srcPath, targetCtx, rawIndex) {
@@ -2782,6 +3325,31 @@ function snapshotAsSaved() {
     steps: cloneFlow(state.steps),
     flowName: state.flowName
   };
+}
+
+function updateGmailStatusLabel() {
+  if (!els.gmailStatus) return;
+  const email = state.settings?.gmailConnection?.email;
+  if (email) {
+    const text = `Connected as ${email}`;
+    els.gmailStatus.textContent = text;
+    els.gmailStatus.title = text;
+  } else {
+    els.gmailStatus.textContent = "Not connected";
+    els.gmailStatus.title = "Not connected";
+  }
+}
+
+async function refreshGmailSettingsFromStorage() {
+  try {
+    const { settings } = await chrome.storage.local.get(["settings"]);
+    if (settings) {
+      state.settings = { ...state.settings, ...(settings || {}) };
+      updateGmailStatusLabel();
+    }
+  } catch (err) {
+    console.error("[options] Failed to refresh Gmail settings:", err);
+  }
 }
 
 // -------- Saved Flows (Library) --------
@@ -2933,6 +3501,13 @@ function validateAndPrepare() {
     if (step.type === "Click" && step.forceClick !== undefined) {
       prepared.forceClick = Boolean(step.forceClick);
     }
+    if (step.type === "Complete") {
+      const outcome = step.status === 'failure' ? 'failure' : 'success';
+      prepared.status = outcome;
+      if (typeof step.message === 'string' && step.message.trim()) {
+        prepared.message = step.message.trim();
+      }
+    }
     // Recursively prepare If branches (supports nested If)
     if (step.type === "If") {
       const prepareChild = (child, pathLabel) => {
@@ -2959,6 +3534,26 @@ function validateAndPrepare() {
           const childElse = Array.isArray(child.else) ? child.else : [];
           cprep.then = childThen.map((g, gi) => prepareChild(g, `${pathLabel} > Then ${gi + 1}`)).filter(Boolean);
           cprep.else = childElse.map((g, gi) => prepareChild(g, `${pathLabel} > Else ${gi + 1}`)).filter(Boolean);
+          const childMode = child.mode || 'exists';
+          if (childMode === 'text') {
+            const match = child.textMatch || 'contains';
+            const childVal = typeof child.textValue === 'string' ? child.textValue.trim() : '';
+            if (!['any', 'empty', 'notEmpty'].includes(match)) {
+              if (!childVal) {
+                errors.push(`Step ${index + 1} (${pathLabel}): Text value is required when using a text condition.`);
+              } else {
+                cprep.textValue = childVal;
+              }
+            }
+            cprep.textMatch = match;
+            cprep.textCaseSensitive = Boolean(child.textCaseSensitive);
+          }
+        } else if (child.type === 'Complete') {
+          const outcome = child.status === 'failure' ? 'failure' : 'success';
+          cprep.status = outcome;
+          if (typeof child.message === 'string' && child.message.trim()) {
+            cprep.message = child.message.trim();
+          }
         }
         return cprep;
       };
@@ -2966,6 +3561,16 @@ function validateAndPrepare() {
       const eArr = Array.isArray(step.else) ? step.else : [];
       prepared.then = tArr.map((c, ci) => prepareChild(c, `Then ${ci + 1}`)).filter(Boolean);
       prepared.else = eArr.map((c, ci) => prepareChild(c, `Else ${ci + 1}`)).filter(Boolean);
+      if ((step.mode || 'exists') === 'text') {
+        const match = step.textMatch || 'contains';
+        const val = typeof step.textValue === 'string' ? step.textValue.trim() : '';
+        if (!['any', 'empty', 'notEmpty'].includes(match)) {
+          if (!val) errors.push(`Step ${index + 1}: Text value is required when using a text condition.`);
+          else prepared.textValue = val;
+        }
+        prepared.textMatch = match;
+        prepared.textCaseSensitive = Boolean(step.textCaseSensitive);
+      }
     }
     if (prepared.type === 'Restart') {
       if (prepared.ifIndex === '' || prepared.ifIndex === null) {
@@ -3023,6 +3628,7 @@ async function requestSelectorPick({ stepIndex, field, ctx }) {
     if (ctx && typeof ctx === 'object') {
       state.pendingPicker.nested = { parentIndex: ctx.parentIndex, branchKey: ctx.branchKey, childIndex: ctx.childIndex };
     }
+    state.inlineInsertActive = false;
     render();
     showStatus(PICKER_STATUS_TEXT, { persistent: true });
 
@@ -3288,6 +3894,7 @@ function handleFlowStatus(msg) {
     state.isRunning = true;
     state.lastRunIncremented = false;
     state.stopSuppressUntil = 0;
+    state.inlineInsertActive = false;
     updateRunButton();
     render();
     return;
@@ -3366,6 +3973,34 @@ function handleFlowIter(msg) {
   state.runCount = (Number(state.runCount) || 0) + 1;
   state.lastRunIncremented = true;
   render();
+}
+
+function handleFlowComplete(msg) {
+  state.isRunning = false;
+  state.stopSuppressUntil = 0;
+  const idx = typeof msg.index === 'number' ? msg.index : null;
+  if (idx != null) {
+    const status = msg.outcome === 'failure' ? 'error' : 'success';
+    state.stepStatuses[idx] = status;
+    for (let j = idx + 1; j < state.stepStatuses.length; j += 1) {
+      if (state.stepStatuses[j] === 'pending' || state.stepStatuses[j] === 'running') {
+        state.stepStatuses[j] = 'idle';
+      }
+    }
+  }
+  state.waitCountdowns = {};
+  state.nestedWaitCountdowns = {};
+  if (msg.outcome !== 'success') {
+    state.lastRunIncremented = false;
+  }
+  state.inlineInsertActive = false;
+  hideGmailConnectPrompt();
+  updateRunButton();
+  render();
+  const baseMessage = (typeof msg.message === 'string' && msg.message.trim())
+    ? msg.message.trim()
+    : (msg.outcome === 'success' ? 'Flow completed.' : 'Flow marked as failed.');
+  showStatus(baseMessage, { persistent: true });
 }
 
 // ---- utils for SelectFiles field ----

@@ -1,8 +1,8 @@
 {
   "name": "AutoFiller Flow Runner",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "manifest_version": 3,
-  "description": "Runs predefined automation flow steps on websites.",
+  "description": "Build and run reusable browser automation flows for repetitive web workflows.",
   "permissions": [
     "storage",
     "scripting",

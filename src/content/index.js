@@ -366,9 +366,21 @@ async function handleRunStep(step) {
         switch (step.type) {
             case "CheckElement": {
                 const selector = typeof step.selector === 'string' ? step.selector : '';
-                const mode = (typeof step.mode === 'string' && step.mode.toLowerCase() === 'visible') ? 'visible' : 'exists';
+                let mode = 'exists';
+                if (typeof step.mode === 'string') {
+                    const normalizedMode = step.mode.toLowerCase();
+                    if (normalizedMode === 'visible') mode = 'visible';
+                    else if (normalizedMode === 'text') mode = 'text';
+                }
                 const timeout = Number(step.timeoutMs) || 0;
-                const cond = await checkElementCondition(selector, mode, timeout);
+                const cond = await checkElementCondition({
+                    selector,
+                    mode,
+                    timeoutMs: timeout,
+                    textMatch: typeof step.textMatch === 'string' ? step.textMatch : 'any',
+                    textValue: typeof step.textValue === 'string' ? step.textValue : '',
+                    caseSensitive: Boolean(step.textCaseSensitive)
+                });
                 return { ok: true, value: cond };
             }
             case "PromptForCode": {
@@ -904,15 +916,27 @@ function syntheticClick(el, x, y) {
     }
 }
 
-async function checkElementCondition(selector, mode, timeoutMs) {
+async function checkElementCondition({ selector, mode, timeoutMs, textMatch = 'any', textValue = '', caseSensitive = false }) {
+    const normalizedMode = typeof mode === 'string' ? mode.toLowerCase() : 'exists';
+    const isTextMode = normalizedMode === 'text';
+    const isVisibleMode = normalizedMode === 'visible';
+    const normalizedMatch = isTextMode ? ((typeof textMatch === 'string' && textMatch) ? textMatch : 'contains') : 'any';
+    const expectedValue = typeof textValue === 'string' ? textValue : '';
     const start = Date.now();
     const poll = 100;
     const test = () => {
         let el = null;
         try { el = document.querySelector(selector); } catch {}
-        if (!el) return false;
-        if (mode === 'exists') return true;
-        return isVisible(el);
+        if (!el) {
+            if (isTextMode && normalizedMatch === 'empty') return true;
+            return false;
+        }
+        if (isVisibleMode && !isVisible(el)) return false;
+        if (isTextMode) {
+            const textOk = evaluateTextCondition(el, normalizedMatch, expectedValue, caseSensitive);
+            if (!textOk) return false;
+        }
+        return true;
     };
     if (!selector || typeof selector !== 'string') return false;
     if (!timeoutMs || timeoutMs <= 0) return test();
@@ -921,6 +945,42 @@ async function checkElementCondition(selector, mode, timeoutMs) {
         await sleep(poll);
     }
     return false;
+}
+
+function evaluateTextCondition(el, mode, expectedRaw, caseSensitive) {
+    if (mode === 'any') return true;
+    const expected = (expectedRaw || '').toString();
+    if (!expected.trim()) return false;
+    let actual = getElementText(el);
+    if (!caseSensitive) {
+        actual = actual.toLowerCase();
+    }
+    const normalizedActual = actual.trim();
+    const normalizedExpected = caseSensitive ? expected.trim() : expected.trim().toLowerCase();
+    switch (mode) {
+        case 'contains':
+            return normalizedActual.includes(normalizedExpected);
+        case 'equals':
+            return normalizedActual === normalizedExpected;
+        case 'startsWith':
+            return normalizedActual.startsWith(normalizedExpected);
+        case 'endsWith':
+            return normalizedActual.endsWith(normalizedExpected);
+        case 'empty':
+            return normalizedActual.length === 0;
+        case 'notEmpty':
+            return normalizedActual.length > 0;
+        default:
+            return true;
+    }
+}
+
+function getElementText(el) {
+    if (!el) return '';
+    if (typeof el.value === 'string') return el.value;
+    if (typeof el.innerText === 'string' && el.innerText.trim() !== '') return el.innerText;
+    if (typeof el.textContent === 'string') return el.textContent;
+    return '';
 }
 
 function isVisible(el) {

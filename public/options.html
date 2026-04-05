@@ -159,6 +159,26 @@
       gap: 12px;
       margin-bottom: 16px;
     }
+    .inline-add-slot {
+      display: flex;
+      pointer-events: none;
+      margin: 4px 0 8px;
+    }
+    .inline-add-slot .inline-add-btn {
+      pointer-events: auto;
+      width: 100%;
+      padding: 10px 14px;
+      border-radius: 12px;
+      border: 1px dashed rgba(37, 99, 235, 0.45);
+      background: rgba(37, 99, 235, 0.08);
+      color: var(--accent);
+      font-weight: 600;
+      transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+    .inline-add-slot .inline-add-btn:hover {
+      background: rgba(37, 99, 235, 0.15);
+      border-color: rgba(37, 99, 235, 0.75);
+    }
     .branch-list:empty {
       margin-bottom: 0;
       padding: 0;
@@ -395,6 +415,7 @@
           <button id="menuReset" type="button">Reset to Default</button>
           <button id="menuExport" type="button">Export JSON</button>
           <button id="menuImport" type="button">Import JSON</button>
+          <button id="menuClear" type="button">Clear Flow</button>
         </div>
       </div>
     </nav>
