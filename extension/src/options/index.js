@@ -9,7 +9,8 @@ const DEFAULT_FLOW = [
 const DEFAULT_SETTINGS = Object.freeze({
   stepDelayMs: 300,
   selectorWaitMs: 5000,
-  useNativeClick: false
+  useNativeClick: false,
+  readInsideIframes: true
 });
 
 const RUN_STATUS_META = {
@@ -186,10 +187,12 @@ const els = {
   stepDelayMs: document.getElementById("stepDelayMs"),
   selectorWaitMs: document.getElementById("selectorWaitMs"),
   useNativeClick: document.getElementById("useNativeClick"),
+  readInsideIframes: document.getElementById("readInsideIframes"),
   gmailClientId: document.getElementById("gmailClientId"),
   connectGmailBtn: document.getElementById("connectGmailBtn"),
   testWaitForEmailGmailBtn: document.getElementById("testWaitForEmailGmailBtn"),
   gmailStatus: document.getElementById("gmailStatus"),
+  versionLabel: document.getElementById("versionLabel"),
   // library controls
   saveAsNewBtn: document.getElementById("saveAsNewBtn"),
   savedFlowsContainer: document.getElementById("savedFlowsContainer"),
@@ -224,6 +227,14 @@ const state = {
 };
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
+
+function getExtensionVersion() {
+  try {
+    return chrome.runtime.getManifest()?.version || "";
+  } catch {
+    return "";
+  }
+}
 
 function isInlineInsertComboActive(event) {
   if (!event) return false;
@@ -812,6 +823,11 @@ function wireEvents() {
     setDirty(true, { silent: true });
   });
 
+  els.readInsideIframes?.addEventListener("change", (e) => {
+    state.settings.readInsideIframes = Boolean(e.target.checked);
+    setDirty(true, { silent: true });
+  });
+
   els.gmailClientId?.addEventListener("input", (e) => {
     const v = e.target.value.trim();
     state.settings.gmailClientId = v;
@@ -915,7 +931,12 @@ function render() {
   if (els.stepDelayMs) els.stepDelayMs.value = String(state.settings.stepDelayMs ?? DEFAULT_SETTINGS.stepDelayMs);
   if (els.selectorWaitMs) els.selectorWaitMs.value = String(state.settings.selectorWaitMs ?? DEFAULT_SETTINGS.selectorWaitMs);
   if (els.useNativeClick) els.useNativeClick.checked = Boolean(state.settings.useNativeClick ?? DEFAULT_SETTINGS.useNativeClick);
+  if (els.readInsideIframes) els.readInsideIframes.checked = Boolean(state.settings.readInsideIframes ?? DEFAULT_SETTINGS.readInsideIframes);
   if (els.gmailClientId) els.gmailClientId.value = String(state.settings.gmailClientId ?? "");
+  if (els.versionLabel) {
+    const version = getExtensionVersion();
+    els.versionLabel.textContent = version ? `Version ${version}` : "Version unavailable";
+  }
   updateGmailStatusLabel();
   updateEmptyState();
   setControlsDisabled(Boolean(state.pendingPicker));

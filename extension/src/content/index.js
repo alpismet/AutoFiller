@@ -2,6 +2,9 @@
 
 let __audioUnlocked = false;
 let __selectorPicker = null;
+const FRAME_BRIDGE_SOURCE = "__AF_FRAME_BRIDGE__";
+const FRAME_BRIDGE_TIMEOUT_MS = 10000;
+const __frameBridgePending = new Map();
 
 const cssEscape = (value) => {
     if (typeof value !== "string") return "";
@@ -11,9 +14,278 @@ const cssEscape = (value) => {
     return value.replace(/[\0-\x1F\x7F"\'\\]/g, "\\$&");
 };
 
-function startSelectorPicker(requestId) {
+function shouldReadInsideIframes(step) {
+    return step?.readInsideIframes !== false;
+}
+
+function createBridgeRequestId(prefix = "af") {
+    return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function postBridgeMessage(targetWindow, payload) {
+    if (!targetWindow || typeof targetWindow.postMessage !== "function") return;
+    targetWindow.postMessage({ ...payload, __afBridge: FRAME_BRIDGE_SOURCE }, "*");
+}
+
+function isBridgeMessage(data) {
+    return !!(data && typeof data === "object" && data.__afBridge === FRAME_BRIDGE_SOURCE && typeof data.type === "string");
+}
+
+function findDirectChildFrameElementByWindow(sourceWindow, rootDocument = document) {
+    if (!sourceWindow) return null;
+    let frames = [];
+    try {
+        frames = Array.from(rootDocument.querySelectorAll("iframe,frame"));
+    } catch {}
+    for (const frame of frames) {
+        try {
+            if (frame.contentWindow === sourceWindow) return frame;
+        } catch {}
+    }
+    return null;
+}
+
+function broadcastBridgeMessageToChildFrames(payload, rootDocument = document) {
+    let frames = [];
+    try {
+        frames = Array.from(rootDocument.querySelectorAll("iframe,frame"));
+    } catch {}
+    frames.forEach((frame) => {
+        try {
+            if (frame.contentWindow) postBridgeMessage(frame.contentWindow, payload);
+        } catch {}
+    });
+}
+
+function sendBridgeRequest(targetWindow, payload, timeoutMs = FRAME_BRIDGE_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+        if (!targetWindow || typeof targetWindow.postMessage !== "function") {
+            reject(new Error("frame_unavailable"));
+            return;
+        }
+        const requestId = createBridgeRequestId("bridge");
+        const timeoutId = setTimeout(() => {
+            __frameBridgePending.delete(requestId);
+            reject(new Error("frame_bridge_timeout"));
+        }, timeoutMs);
+        __frameBridgePending.set(requestId, { resolve, reject, timeoutId });
+        postBridgeMessage(targetWindow, { ...payload, requestId });
+    });
+}
+
+function getAccessibleFrameDocument(frame) {
+    const isIFrame = typeof HTMLIFrameElement !== "undefined" && frame instanceof HTMLIFrameElement;
+    const isFrame = typeof HTMLFrameElement !== "undefined" && frame instanceof HTMLFrameElement;
+    if (!isIFrame && !isFrame) return null;
+    try {
+        const doc = frame.contentDocument;
+        if (!doc?.documentElement) return null;
+        void doc.defaultView?.location?.href;
+        return doc;
+    } catch {
+        return null;
+    }
+}
+
+function collectSearchDocuments({ includeIframes = true, rootDocument = document } = {}) {
+    const docs = [rootDocument];
+    if (!includeIframes) return docs;
+
+    const queue = [rootDocument];
+    const seen = new Set([rootDocument]);
+    while (queue.length) {
+        const currentDoc = queue.shift();
+        let frames = [];
+        try {
+            frames = Array.from(currentDoc.querySelectorAll("iframe,frame"));
+        } catch {}
+        frames.forEach((frame) => {
+            const frameDoc = getAccessibleFrameDocument(frame);
+            if (!frameDoc || seen.has(frameDoc)) return;
+            seen.add(frameDoc);
+            docs.push(frameDoc);
+            queue.push(frameDoc);
+        });
+    }
+    return docs;
+}
+
+function querySelectorAcrossDocuments(selector, options = {}) {
+    if (!selector || typeof selector !== "string") return null;
+    const scoped = resolveScopedSelectorContext(selector, options);
+    if (scoped?.scoped) {
+        try {
+            return scoped.document.querySelector(scoped.finalSelector);
+        } catch {
+            return null;
+        }
+    }
+    const docs = collectSearchDocuments(options);
+    for (const doc of docs) {
+        try {
+            const el = doc.querySelector(scoped?.finalSelector || selector);
+            if (el) return el;
+        } catch {}
+    }
+    return null;
+}
+
+function querySelectorAllAcrossDocuments(selector, options = {}) {
+    if (!selector || typeof selector !== "string") return [];
+    const scoped = resolveScopedSelectorContext(selector, options);
+    if (scoped?.scoped) {
+        try {
+            return Array.from(scoped.document.querySelectorAll(scoped.finalSelector));
+        } catch {
+            return [];
+        }
+    }
+    const docs = collectSearchDocuments(options);
+    const matches = [];
+    for (const doc of docs) {
+        try {
+            matches.push(...Array.from(doc.querySelectorAll(scoped?.finalSelector || selector)));
+        } catch {}
+    }
+    return matches;
+}
+
+function findElementByIdAcrossDocuments(id, options = {}) {
+    if (!id || typeof id !== "string") return null;
+    const docs = collectSearchDocuments(options);
+    for (const doc of docs) {
+        try {
+            const el = doc.getElementById(id);
+            if (el) return el;
+        } catch {}
+    }
+    return null;
+}
+
+function getOwnerWindow(el) {
+    return el?.ownerDocument?.defaultView || window;
+}
+
+function scrollIntoViewAcrossFrames(el) {
+    let current = el instanceof Element ? el : null;
+    while (current) {
+        try {
+            current.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        } catch {}
+        const ownerWindow = current.ownerDocument?.defaultView;
+        const frameElement = ownerWindow?.frameElement;
+        current = frameElement instanceof Element ? frameElement : null;
+    }
+}
+
+function getElementRectInTopViewport(el) {
+    const rect = el.getBoundingClientRect();
+    let left = rect.left;
+    let top = rect.top;
+    let currentWindow = el.ownerDocument?.defaultView;
+
+    while (currentWindow && currentWindow !== window && currentWindow.frameElement instanceof Element) {
+        const frameRect = currentWindow.frameElement.getBoundingClientRect();
+        left += frameRect.left;
+        top += frameRect.top;
+        currentWindow = currentWindow.parent;
+    }
+
+    return {
+        left,
+        top,
+        width: rect.width,
+        height: rect.height
+    };
+}
+
+function buildSelectorInDocument(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return "";
+    const nodeDoc = node.ownerDocument || document;
+    if (node.id) return `#${cssEscape(node.id)}`;
+
+    const segments = [];
+    let current = node;
+    let depth = 0;
+
+    while (current && current.nodeType === Node.ELEMENT_NODE && depth < 10) {
+        let segment = current.tagName.toLowerCase();
+        if (current.classList.length) {
+            const classNames = Array.from(current.classList)
+                .filter(Boolean)
+                .slice(0, 2)
+                .map((cls) => `.${cssEscape(cls)}`)
+                .join("");
+            segment += classNames;
+        }
+
+        const parent = current.parentElement;
+        if (parent) {
+            const siblings = Array.from(parent.children).filter((child) => child.tagName === current.tagName);
+            if (siblings.length > 1) {
+                const index = siblings.indexOf(current) + 1;
+                segment += `:nth-of-type(${index})`;
+            }
+        }
+
+        segments.unshift(segment);
+        const candidate = segments.join(" > ");
+        try {
+            const matches = nodeDoc.querySelectorAll(candidate);
+            if (matches.length === 1 && matches[0] === node) {
+                return candidate;
+            }
+        } catch {}
+
+        current = parent;
+        depth += 1;
+    }
+
+    return segments.join(" > ") || node.tagName.toLowerCase();
+}
+
+function splitScopedSelector(selector) {
+    return String(selector)
+        .split(/\s*>>>\s*/g)
+        .map((part) => part.trim())
+        .filter(Boolean);
+}
+
+function resolveScopedSelectorContext(selector, { rootDocument = document } = {}) {
+    const parts = splitScopedSelector(selector);
+    if (!parts.length) return null;
+    if (parts.length === 1) {
+        return {
+            document: rootDocument,
+            finalSelector: parts[0],
+            scoped: false
+        };
+    }
+
+    let currentDoc = rootDocument;
+    for (const frameSelector of parts.slice(0, -1)) {
+        let frame = null;
+        try {
+            frame = currentDoc.querySelector(frameSelector);
+        } catch {
+            return null;
+        }
+        const frameDoc = getAccessibleFrameDocument(frame);
+        if (!frameDoc) return null;
+        currentDoc = frameDoc;
+    }
+
+    return {
+        document: currentDoc,
+        finalSelector: parts[parts.length - 1],
+        scoped: true
+    };
+}
+
+function startSelectorPicker(requestId, { broadcast = false } = {}) {
     if (!document.body) return false;
-    if (__selectorPicker) stopSelectorPicker(false, { notify: false });
+    if (__selectorPicker) stopSelectorPicker(false, { notify: false, broadcast: false });
+    const showTooltip = window === window.top;
 
     const highlight = document.createElement("div");
     highlight.id = "__af-picker-highlight";
@@ -28,39 +300,43 @@ function startSelectorPicker(requestId) {
         display: "none"
     });
 
-    const tooltip = document.createElement("div");
-    tooltip.id = "__af-picker-tooltip";
-    tooltip.innerText = "Click element to capture selector • Esc to cancel";
-    Object.assign(tooltip.style, {
-        position: "fixed",
-        left: "50%",
-        bottom: "28px",
-        transform: "translateX(-50%)",
-        padding: "8px 14px",
-        borderRadius: "999px",
-        fontSize: "13px",
-        fontFamily: "system-ui, -apple-system, Segoe UI, sans-serif",
-        background: "#1f2937",
-        color: "#f8fafc",
-        boxShadow: "0 8px 20px rgba(15,23,42,0.35)",
-        pointerEvents: "none",
-        zIndex: "2147483647"
-    });
+    const tooltip = showTooltip ? document.createElement("div") : null;
+    if (tooltip) {
+        tooltip.id = "__af-picker-tooltip";
+        tooltip.innerText = "Click element to capture selector • Esc to cancel";
+        Object.assign(tooltip.style, {
+            position: "fixed",
+            left: "50%",
+            bottom: "28px",
+            transform: "translateX(-50%)",
+            padding: "8px 14px",
+            borderRadius: "999px",
+            fontSize: "13px",
+            fontFamily: "system-ui, -apple-system, Segoe UI, sans-serif",
+            background: "#1f2937",
+            color: "#f8fafc",
+            boxShadow: "0 8px 20px rgba(15,23,42,0.35)",
+            pointerEvents: "none",
+            zIndex: "2147483647"
+        });
+    }
 
     document.body.appendChild(highlight);
-    document.body.appendChild(tooltip);
+    if (tooltip) document.body.appendChild(tooltip);
 
     const pickerState = {
         requestId,
         highlight,
         tooltip,
         currentTarget: null,
-        handlers: {}
+        handlers: {},
+        registrations: []
     };
 
     const updateTooltip = (target) => {
         if (!pickerState.tooltip) return;
-        if (!target || target === document.body || target === document.documentElement) {
+        const ownerDoc = target?.ownerDocument || document;
+        if (!target || target === ownerDoc.body || target === ownerDoc.documentElement) {
             pickerState.tooltip.innerText = "Click element to capture selector • Esc to cancel";
             return;
         }
@@ -87,18 +363,45 @@ function startSelectorPicker(requestId) {
         event.stopImmediatePropagation();
         const target = pickerState.currentTarget || resolvePickerTarget(event.target);
         if (!target) return;
-        const selector = computeUniqueSelector(target);
+        const selector = buildSelectorInDocument(target);
         if (selector) {
-            stopSelectorPicker(true, { selector });
+            if (window === window.top) {
+                stopSelectorPicker(true, { selector, broadcast: true });
+            } else {
+                stopPickerLocally();
+                postBridgeMessage(window.parent, {
+                    type: "AF_PICKER_RESULT",
+                    requestId,
+                    selector
+                });
+            }
         } else {
-            stopSelectorPicker(false, { reason: "selector_not_found" });
+            if (window === window.top) {
+                stopSelectorPicker(false, { reason: "selector_not_found", broadcast: true });
+            } else {
+                stopPickerLocally();
+                postBridgeMessage(window.parent, {
+                    type: "AF_PICKER_CANCEL",
+                    requestId,
+                    reason: "selector_not_found"
+                });
+            }
         }
     };
 
     const keyHandler = (event) => {
         if (event.key === "Escape") {
             event.preventDefault();
-            stopSelectorPicker(false, { reason: "cancelled" });
+            if (window === window.top) {
+                stopSelectorPicker(false, { reason: "cancelled", broadcast: true });
+            } else {
+                stopPickerLocally();
+                postBridgeMessage(window.parent, {
+                    type: "AF_PICKER_CANCEL",
+                    requestId,
+                    reason: "cancelled"
+                });
+            }
         }
     };
 
@@ -122,35 +425,34 @@ function startSelectorPicker(requestId) {
         preventHandler
     };
 
-    document.addEventListener("mousemove", moveHandler, true);
-    document.addEventListener("mousedown", preventHandler, true);
-    document.addEventListener("mouseup", preventHandler, true);
-    document.addEventListener("click", clickHandler, true);
-    document.addEventListener("keydown", keyHandler, true);
-    document.addEventListener("contextmenu", contextHandler, true);
-    window.addEventListener("scroll", scrollHandler, true);
+    const docs = broadcast ? [document] : collectSearchDocuments({ includeIframes: true });
+    docs.forEach((doc) => {
+        doc.addEventListener("mousemove", moveHandler, true);
+        doc.addEventListener("mousedown", preventHandler, true);
+        doc.addEventListener("mouseup", preventHandler, true);
+        doc.addEventListener("click", clickHandler, true);
+        doc.addEventListener("keydown", keyHandler, true);
+        doc.addEventListener("contextmenu", contextHandler, true);
+        doc.defaultView?.addEventListener("scroll", scrollHandler, true);
+        pickerState.registrations.push({ doc, win: doc.defaultView || null });
+    });
 
     __selectorPicker = pickerState;
+    if (broadcast) {
+        broadcastBridgeMessageToChildFrames({ type: "AF_PICKER_START", requestId });
+    }
     return true;
 }
 
 function stopSelectorPicker(success, detail = {}) {
     if (!__selectorPicker) return;
-    const { highlight, tooltip, handlers, requestId } = __selectorPicker;
-    if (highlight?.parentNode) highlight.parentNode.removeChild(highlight);
-    if (tooltip?.parentNode) tooltip.parentNode.removeChild(tooltip);
-
-    if (handlers) {
-        document.removeEventListener("mousemove", handlers.moveHandler, true);
-        document.removeEventListener("mousedown", handlers.preventHandler, true);
-        document.removeEventListener("mouseup", handlers.preventHandler, true);
-        document.removeEventListener("click", handlers.clickHandler, true);
-        document.removeEventListener("keydown", handlers.keyHandler, true);
-        document.removeEventListener("contextmenu", handlers.contextHandler, true);
-        window.removeEventListener("scroll", handlers.scrollHandler, true);
-    }
-
+    const { requestId } = __selectorPicker;
+    stopPickerLocally();
     __selectorPicker = null;
+
+    if (detail.broadcast) {
+        broadcastBridgeMessageToChildFrames({ type: "AF_PICKER_STOP", requestId });
+    }
 
     if (!requestId) return;
     if (success && detail.selector) {
@@ -174,11 +476,12 @@ function resolvePickerTarget(node) {
 
 function positionHighlight(target, highlight) {
     if (!highlight) return;
-    if (!target || target === document.body || target === document.documentElement) {
+    const ownerDoc = target?.ownerDocument || document;
+    if (!target || target === ownerDoc.body || target === ownerDoc.documentElement) {
         highlight.style.display = "none";
         return;
     }
-    const rect = target.getBoundingClientRect();
+    const rect = getElementRectInTopViewport(target);
     highlight.style.display = "block";
     highlight.style.left = `${rect.left}px`;
     highlight.style.top = `${rect.top}px`;
@@ -196,46 +499,74 @@ function describeElement(el) {
 
 function computeUniqueSelector(element) {
     if (!element || element.nodeType !== Node.ELEMENT_NODE) return "";
-    if (element.id) return `#${cssEscape(element.id)}`;
-
-    const segments = [];
-    let current = element;
-    let depth = 0;
-
-    while (current && current.nodeType === Node.ELEMENT_NODE && depth < 10) {
-        let segment = current.tagName.toLowerCase();
-        if (current.classList.length) {
-            const classNames = Array.from(current.classList)
-                .filter(Boolean)
-                .slice(0, 2)
-                .map((cls) => `.${cssEscape(cls)}`)
-                .join("");
-            segment += classNames;
-        }
-
-        const parent = current.parentElement;
-        if (parent) {
-            const siblings = Array.from(parent.children).filter((child) => child.tagName === current.tagName);
-            if (siblings.length > 1) {
-                const index = siblings.indexOf(current) + 1;
-                segment += `:nth-of-type(${index})`;
-            }
-        }
-
-        segments.unshift(segment);
-        const candidate = segments.join(" > ");
-        try {
-            const matches = document.querySelectorAll(candidate);
-            if (matches.length === 1 && matches[0] === element) {
-                return candidate;
-            }
-        } catch {}
-
-        current = parent;
-        depth += 1;
+    const scopeDoc = element.ownerDocument || document;
+    const targetSelector = buildSelectorInDocument(element);
+    const frameSelectors = [];
+    let currentWindow = scopeDoc.defaultView;
+    while (currentWindow && currentWindow !== window && currentWindow.frameElement instanceof Element) {
+        const frameSelector = buildSelectorInDocument(currentWindow.frameElement);
+        if (!frameSelector) break;
+        frameSelectors.unshift(frameSelector);
+        currentWindow = currentWindow.parent;
     }
 
-    return segments.join(" > ") || element.tagName.toLowerCase();
+    return frameSelectors.length ? [...frameSelectors, targetSelector].join(" >>> ") : targetSelector;
+}
+
+function stopPickerLocally() {
+    if (!__selectorPicker) return;
+    const { highlight, tooltip, handlers, registrations } = __selectorPicker;
+    if (highlight?.parentNode) highlight.parentNode.removeChild(highlight);
+    if (tooltip?.parentNode) tooltip.parentNode.removeChild(tooltip);
+    if (handlers) {
+        (registrations || []).forEach(({ doc, win }) => {
+            doc?.removeEventListener("mousemove", handlers.moveHandler, true);
+            doc?.removeEventListener("mousedown", handlers.preventHandler, true);
+            doc?.removeEventListener("mouseup", handlers.preventHandler, true);
+            doc?.removeEventListener("click", handlers.clickHandler, true);
+            doc?.removeEventListener("keydown", handlers.keyHandler, true);
+            doc?.removeEventListener("contextmenu", handlers.contextHandler, true);
+            win?.removeEventListener("scroll", handlers.scrollHandler, true);
+        });
+    }
+    __selectorPicker = null;
+}
+
+function extractCrossOriginFrameContext(selector) {
+    const parts = splitScopedSelector(selector);
+    if (parts.length < 2) return null;
+    let currentDoc = document;
+    for (let i = 0; i < parts.length - 1; i += 1) {
+        let frame = null;
+        try {
+            frame = currentDoc.querySelector(parts[i]);
+        } catch {
+            return null;
+        }
+        if (!frame) return null;
+        const frameDoc = getAccessibleFrameDocument(frame);
+        if (frameDoc) {
+            currentDoc = frameDoc;
+            continue;
+        }
+        return {
+            frameElement: frame,
+            remainingSelector: parts.slice(i + 1).join(" >>> ")
+        };
+    }
+    return null;
+}
+
+async function maybeDelegateStepToChildFrame(step) {
+    const selector = typeof step?.selector === "string" ? step.selector : "";
+    if (!selector.includes(">>>")) return null;
+    const frameContext = extractCrossOriginFrameContext(selector);
+    if (!frameContext?.frameElement?.contentWindow) return null;
+    const childStep = { ...step, selector: frameContext.remainingSelector };
+    return sendBridgeRequest(frameContext.frameElement.contentWindow, {
+        type: "AF_RUN_STEP_REQUEST",
+        step: childStep
+    });
 }
 
 function sendRuntimeMessage(payload) {
@@ -342,12 +673,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || !msg.type) return;
     if (msg.type === "PING") { try { sendResponse?.({ ok: true, alive: true }); } catch {} return; }
     if (msg.type === "START_PICKER") {
-        const ok = startSelectorPicker(msg.requestId || null);
+        const ok = startSelectorPicker(msg.requestId || null, { broadcast: true });
         sendResponse?.({ ok });
         return;
     }
     if (msg.type === "CANCEL_PICKER") {
-        stopSelectorPicker(false, { reason: "cancelled" });
+        stopSelectorPicker(false, { reason: "cancelled", broadcast: true });
         sendResponse?.({ ok: true });
         return;
     }
@@ -360,9 +691,79 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 });
 
+window.addEventListener("message", (event) => {
+    if (!isBridgeMessage(event.data)) return;
+    const data = event.data;
+
+    if (data.type === "AF_PICKER_START") {
+        startSelectorPicker(data.requestId || null, { broadcast: true });
+        return;
+    }
+
+    if (data.type === "AF_PICKER_STOP") {
+        stopSelectorPicker(false, { notify: false, broadcast: true });
+        return;
+    }
+
+    if (data.type === "AF_PICKER_RESULT") {
+        const frameElement = findDirectChildFrameElementByWindow(event.source, document);
+        const frameSelector = buildSelectorInDocument(frameElement);
+        const combinedSelector = frameSelector && data.selector ? `${frameSelector} >>> ${data.selector}` : data.selector || frameSelector;
+        if (window === window.top) {
+            stopSelectorPicker(true, { selector: combinedSelector, broadcast: true });
+        } else {
+            stopPickerLocally();
+            postBridgeMessage(window.parent, {
+                type: "AF_PICKER_RESULT",
+                requestId: data.requestId || null,
+                selector: combinedSelector
+            });
+        }
+        return;
+    }
+
+    if (data.type === "AF_PICKER_CANCEL") {
+        if (window === window.top) {
+            stopSelectorPicker(false, { reason: data.reason || "cancelled", broadcast: true });
+        } else {
+            stopPickerLocally();
+            postBridgeMessage(window.parent, {
+                type: "AF_PICKER_CANCEL",
+                requestId: data.requestId || null,
+                reason: data.reason || "cancelled"
+            });
+        }
+        return;
+    }
+
+    if (data.type === "AF_RUN_STEP_REQUEST") {
+        (async () => {
+            const result = await handleRunStep(data.step || {});
+            postBridgeMessage(event.source, {
+                type: "AF_RUN_STEP_RESPONSE",
+                requestId: data.requestId,
+                result
+            });
+        })();
+        return;
+    }
+
+    if (data.type === "AF_RUN_STEP_RESPONSE") {
+        const pending = __frameBridgePending.get(data.requestId);
+        if (!pending) return;
+        clearTimeout(pending.timeoutId);
+        __frameBridgePending.delete(data.requestId);
+        pending.resolve(data.result);
+    }
+});
+
 async function handleRunStep(step) {
     if (!step || typeof step.type !== "string") return { ok: false, error: "invalid_step" };
     try {
+        if (["CheckElement", "Click", "FillText", "SelectDropdown"].includes(step.type)) {
+            const delegated = await maybeDelegateStepToChildFrame(step);
+            if (delegated) return delegated;
+        }
         switch (step.type) {
             case "CheckElement": {
                 const selector = typeof step.selector === 'string' ? step.selector : '';
@@ -379,7 +780,8 @@ async function handleRunStep(step) {
                     timeoutMs: timeout,
                     textMatch: typeof step.textMatch === 'string' ? step.textMatch : 'any',
                     textValue: typeof step.textValue === 'string' ? step.textValue : '',
-                    caseSensitive: Boolean(step.textCaseSensitive)
+                    caseSensitive: Boolean(step.textCaseSensitive),
+                    includeIframes: shouldReadInsideIframes(step)
                 });
                 return { ok: true, value: cond };
             }
@@ -390,19 +792,24 @@ async function handleRunStep(step) {
             }
             case "Click": {
                 const timeout = Number(step.selectorWaitMs) || 5000;
-                const base = await waitForSelectorSafe(step.selector, timeout);
+                const base = await waitForSelectorSafe(step.selector, timeout, { includeIframes: shouldReadInsideIframes(step) });
                 if (!base) return { ok: false, error: "selector_not_found" };
                 const el = findClickable(base);
                 // Respond first, then perform click respecting per-step forceClick or global setting
                 setTimeout(() => {
                     try {
-                        const rect = el.getBoundingClientRect();
-                        const cx = rect.left + Math.max(1, rect.width) / 2;
-                        const cy = rect.top + Math.max(1, rect.height) / 2;
                         const useNative = Boolean(step.forceClick || step.useNativeClick);
                         // When forcing/native allowed, robustClick attempts native first and falls back to synthetic
                         // Otherwise, still use the hardened synthetic sequence
-                        if (useNative) robustClick(el); else syntheticClick(el, cx, cy);
+                        if (useNative) {
+                            robustClick(el);
+                        } else {
+                            scrollIntoViewAcrossFrames(el);
+                            const rect = el.getBoundingClientRect();
+                            const cx = rect.left + Math.max(1, rect.width) / 2;
+                            const cy = rect.top + Math.max(1, rect.height) / 2;
+                            syntheticClick(el, cx, cy);
+                        }
                     } catch {}
                 }, 0);
                 return { ok: true };
@@ -410,6 +817,7 @@ async function handleRunStep(step) {
 
             case "FillText": {
                 const timeout = Number(step.selectorWaitMs) || 5000;
+                const includeIframes = shouldReadInsideIframes(step);
                 const value = await resolveVariablesInText(step.value);
                 if (step.splitAcrossInputs) {
                     const start = Date.now();
@@ -418,9 +826,7 @@ async function handleRunStep(step) {
                     const chars = onlyDigits && onlyDigits.length ? onlyDigits : Array.from(String(value));
 
                     const collectInputs = () => {
-                        const base = (() => {
-                            try { return document.querySelectorAll(step.selector); } catch { return []; }
-                        })();
+                        const base = querySelectorAllAcrossDocuments(step.selector, { includeIframes });
                         let list = Array.from(base).filter(n => n && n.nodeType === Node.ELEMENT_NODE && (n.matches?.('input,textarea,[contenteditable="true"]') || 'value' in n));
                         if (!list.length) {
                             const descendant = [];
@@ -483,7 +889,7 @@ async function handleRunStep(step) {
                     return { ok: true };
                             } else {
                                 // Resolve actual editable target: selector may point to a wrapper (e.g., date-picker)
-                                const base = await waitForSelectorSafe(step.selector, timeout);
+                                const base = await waitForSelectorSafe(step.selector, timeout, { includeIframes });
                                 if (!base) return { ok: false, error: "selector_not_found" };
                                 const isEditable = (n) => !!(n && (n.matches?.('input,textarea,[contenteditable="true"]') || 'value' in n));
                                 let el = isEditable(base) ? base : null;
@@ -505,7 +911,7 @@ async function handleRunStep(step) {
                                     }
                                     const forId = lbl?.getAttribute?.('for');
                                     if (forId) {
-                                        const byId = document.getElementById(forId);
+                                        const byId = base.ownerDocument?.getElementById(forId) || findElementByIdAcrossDocuments(forId, { includeIframes, rootDocument: base.ownerDocument || document });
                                         if (isEditable(byId)) el = byId;
                                     }
                                 }
@@ -559,7 +965,8 @@ async function handleRunStep(step) {
 
                         case "SelectDropdown": {
                                 const timeout = Number(step.timeoutMs) || 10000;
-                                const control = await waitForSelectorSafe(step.controlSelector, timeout);
+                                const includeIframes = shouldReadInsideIframes(step);
+                                const control = await waitForSelectorSafe(step.controlSelector, timeout, { includeIframes });
                                 if (!control) return { ok: false, error: "control_not_found" };
                                 // Open the dropdown (click or Enter)
                                 try { control.focus(); } catch {}
@@ -576,11 +983,13 @@ async function handleRunStep(step) {
                                 const start = Date.now();
                                 while (Date.now() - start <= timeout) {
                                     try {
-                                        items = Array.from(document.querySelectorAll(itemSel));
+                                        items = Array.from(control.ownerDocument?.querySelectorAll(itemSel) || []);
                                         if (items.length) break;
                                         // Try looking within likely container elements (dropdowns near control)
-                                        const root = control.closest('[aria-controls]') || control.parentElement || document.body;
-                                        items = Array.from((root || document).querySelectorAll(itemSel));
+                                        const root = control.closest('[aria-controls]') || control.parentElement || control.ownerDocument?.body;
+                                        items = Array.from((root || control.ownerDocument || document).querySelectorAll(itemSel));
+                                        if (items.length) break;
+                                        items = querySelectorAllAcrossDocuments(itemSel, { includeIframes, rootDocument: control.ownerDocument || document });
                                         if (items.length) break;
                                     } catch {}
                                     await sleep(100);
@@ -613,15 +1022,16 @@ async function handleRunStep(step) {
 
             case "SelectFiles": {
                 const timeout = Number(step.selectorWaitMs) || 5000;
+                const includeIframes = shouldReadInsideIframes(step);
                 // Find primary element from selector
-                let baseEl = await waitForSelectorSafe(step.selector, timeout);
+                let baseEl = await waitForSelectorSafe(step.selector, timeout, { includeIframes });
                 if (!baseEl) return { ok: false, error: "selector_not_found" };
 
                 // Resolve input and drop target
                 const asInput = (el) => el && el.tagName && el.tagName.toLowerCase() === 'input' && ((el.getAttribute('type')||'').toLowerCase() === 'file');
                 let input = asInput(baseEl) ? baseEl : (baseEl.querySelector ? baseEl.querySelector("input[type='file']") : null);
                 if (!input) {
-                    try { input = document.querySelector(step.selector + " input[type='file']"); } catch {}
+                    input = querySelectorAcrossDocuments(step.selector + " input[type='file']", { includeIframes, rootDocument: baseEl.ownerDocument || document });
                 }
 
                 let dropEl = findDropTarget(baseEl) || baseEl;
@@ -756,30 +1166,26 @@ async function resolveVariablesInText(text) {
     return out;
 }
 
-async function waitForSelectorSafe(selector, timeoutMs) {
+async function waitForSelectorSafe(selector, timeoutMs, options = {}) {
     if (!selector || typeof selector !== "string") return null;
     const start = Date.now();
     const poll = 100;
     let el = null;
     while (Date.now() - start <= timeoutMs) {
-        try {
-            el = document.querySelector(selector);
-            if (el) return el;
-        } catch {}
+        el = querySelectorAcrossDocuments(selector, options);
+        if (el) return el;
         await sleep(poll);
     }
     return null;
 }
 
-async function waitForAllSelectors(selector, timeoutMs) {
+async function waitForAllSelectors(selector, timeoutMs, options = {}) {
     if (!selector || typeof selector !== "string") return [];
     const start = Date.now();
     const poll = 100;
     while (Date.now() - start <= timeoutMs) {
-        try {
-            const list = document.querySelectorAll(selector);
-            if (list && list.length) return list;
-        } catch {}
+        const list = querySelectorAllAcrossDocuments(selector, options);
+        if (list && list.length) return list;
         await sleep(poll);
     }
     return [];
@@ -877,29 +1283,32 @@ function findClickable(node) {
 
 function robustClick(el) {
     if (!el || !(el instanceof Element)) return;
-    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch {}
-    const rect = el.getBoundingClientRect();
-    const x = rect.left + Math.max(1, rect.width) / 2;
-    const y = rect.top + Math.max(1, rect.height) / 2;
+    scrollIntoViewAcrossFrames(el);
+    const localRect = el.getBoundingClientRect();
+    const topRect = getElementRectInTopViewport(el);
+    const localX = localRect.left + Math.max(1, localRect.width) / 2;
+    const localY = localRect.top + Math.max(1, localRect.height) / 2;
+    const topX = topRect.left + Math.max(1, topRect.width) / 2;
+    const topY = topRect.top + Math.max(1, topRect.height) / 2;
     // Try native click first via background (isTrusted). If it fails, fallback to synthetic.
     try {
-        chrome.runtime.sendMessage({ type: 'NATIVE_CLICK', x, y }, (res) => {
+        chrome.runtime.sendMessage({ type: 'NATIVE_CLICK', x: topX, y: topY }, (res) => {
             if (chrome.runtime.lastError) {
                 // cannot use native; fallback
-                syntheticClick(el, x, y);
+                syntheticClick(el, localX, localY);
                 return;
             }
             if (!res || res.ok !== true) {
-                syntheticClick(el, x, y);
+                syntheticClick(el, localX, localY);
             }
         });
     } catch {
-        syntheticClick(el, x, y);
+        syntheticClick(el, localX, localY);
     }
 }
 
 function syntheticClick(el, x, y) {
-    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+    const opts = { bubbles: true, cancelable: true, view: getOwnerWindow(el), clientX: x, clientY: y, button: 0 };
     try {
         el.dispatchEvent(new PointerEvent('pointerover', opts));
         el.dispatchEvent(new PointerEvent('pointerenter', opts));
@@ -916,7 +1325,7 @@ function syntheticClick(el, x, y) {
     }
 }
 
-async function checkElementCondition({ selector, mode, timeoutMs, textMatch = 'any', textValue = '', caseSensitive = false }) {
+async function checkElementCondition({ selector, mode, timeoutMs, textMatch = 'any', textValue = '', caseSensitive = false, includeIframes = true }) {
     const normalizedMode = typeof mode === 'string' ? mode.toLowerCase() : 'exists';
     const isTextMode = normalizedMode === 'text';
     const isVisibleMode = normalizedMode === 'visible';
@@ -925,8 +1334,7 @@ async function checkElementCondition({ selector, mode, timeoutMs, textMatch = 'a
     const start = Date.now();
     const poll = 100;
     const test = () => {
-        let el = null;
-        try { el = document.querySelector(selector); } catch {}
+        const el = querySelectorAcrossDocuments(selector, { includeIframes });
         if (!el) {
             if (isTextMode && normalizedMatch === 'empty') return true;
             return false;

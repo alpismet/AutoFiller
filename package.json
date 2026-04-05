@@ -1,10 +1,10 @@
 {
   "name": "autofiller",
-  "version": "0.3.0",
+  "version": "0.3.4",
   "private": true,
   "description": "Chrome extension for reusable browser automation flows and repetitive form workflows.",
   "scripts": {
-    "build": "node scripts/build.mjs"
+    "build": "node extension/scripts/build.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.3"

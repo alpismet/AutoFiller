@@ -9,12 +9,51 @@ const DEFAULT_FLOW = [
 ];
 
 const OFFSCREEN_DOCUMENT_URL = "offscreen.html";
+const DEFAULT_SETTINGS = Object.freeze({
+  stepDelayMs: 300,
+  selectorWaitMs: 5000,
+  useNativeClick: false,
+  readInsideIframes: true
+});
+
 let offscreenCreationPromise = null;
 let activePicker = null;
 let isFlowRunning = false;
 let stopRequested = false;
 let gmailPromptCounter = 0;
 const gmailPromptWaiters = new Map();
+
+async function loadSettings() {
+  let settings = { ...DEFAULT_SETTINGS };
+  try {
+    const stored = await chrome.storage.local.get(["settings"]);
+    settings = { ...settings, ...(stored?.settings || {}) };
+  } catch {}
+  return settings;
+}
+
+function buildRuntimeStep(step, settings, overrides = {}) {
+  return {
+    ...step,
+    selectorWaitMs: settings.selectorWaitMs,
+    useNativeClick: settings.useNativeClick,
+    readInsideIframes: settings.readInsideIframes !== false,
+    ...overrides
+  };
+}
+
+function buildCheckElementStep(step, settings) {
+  return {
+    type: 'CheckElement',
+    selector: step.selector,
+    mode: step.mode || 'exists',
+    timeoutMs: step.timeoutMs || 0,
+    textMatch: step.textMatch || 'any',
+    textValue: step.textValue || '',
+    textCaseSensitive: Boolean(step.textCaseSensitive),
+    readInsideIframes: settings.readInsideIframes !== false
+  };
+}
 
 function getRestartOutcome(step) {
   if (typeof step !== "object" || !step) return null;
@@ -200,9 +239,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (isForbiddenUrl(url)) { sendResponse({ ok: false, error: "Forbidden URL" }); return; }
         await ensureContentScript(targetTabId);
 
-        // settings
-  let settings = { selectorWaitMs: 5000, useNativeClick: false };
-        try { const s = await chrome.storage.local.get(["settings"]); settings = { ...settings, ...(s?.settings || {}) }; } catch {}
+        const settings = await loadSettings();
 
         const index = typeof msg.index === "number" ? msg.index : -1;
         if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "running" });
@@ -237,15 +274,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         } else if (step.type === 'If') {
           await ensureContentScript(targetTabId);
-          const res = await chrome.tabs.sendMessage(targetTabId, { type: 'RUN_STEP', step: {
-            type: 'CheckElement',
-            selector: step.selector,
-            mode: step.mode || 'exists',
-            timeoutMs: step.timeoutMs || 0,
-            textMatch: step.textMatch || 'any',
-            textValue: step.textValue || '',
-            textCaseSensitive: Boolean(step.textCaseSensitive)
-          } });
+          const res = await chrome.tabs.sendMessage(targetTabId, { type: 'RUN_STEP', step: buildCheckElementStep(step, settings) });
           const cond = Boolean(res && (res.value === true || res.ok === true && res.value !== false));
           try { if (index >= 0) broadcastToOptions({ type: 'IF_RESULT', index, result: cond ? 'then' : 'else' }); } catch {}
           const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
@@ -270,7 +299,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!res?.ok) throw new Error(res?.error || "step_failed");
         } else {
           await ensureContentScript(targetTabId);
-          const res = await chrome.tabs.sendMessage(targetTabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(msg?.step?.forceClick) } });
+          const res = await chrome.tabs.sendMessage(targetTabId, { type: "RUN_STEP", step: buildRuntimeStep(step, settings, { forceClick: Boolean(msg?.step?.forceClick) }) });
           if (res && res.ok === false) throw new Error(res.error || "step_failed");
         }
         if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "success" });
@@ -509,7 +538,7 @@ async function ensureContentScript(tabId) {
     return true;
   } catch {
     try {
-      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+      await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["content.js"] });
       await wait(100);
       // try ping again but swallow errors
       try { await chrome.tabs.sendMessage(tabId, { type: "PING" }); } catch {}
@@ -522,12 +551,7 @@ async function ensureContentScript(tabId) {
 }
 
 async function runFlow(flow, tabId) {
-  // read settings
-  let settings = { stepDelayMs: 300, selectorWaitMs: 5000, useNativeClick: false };
-  try {
-    const s = await chrome.storage.local.get(["settings"]);
-    settings = { ...settings, ...(s?.settings || {}) };
-  } catch {}
+  const settings = await loadSettings();
 
   // notify options to reset statuses
   broadcastToOptions({ type: "FLOW_STATUS", kind: "FLOW_RESET" });
@@ -582,15 +606,7 @@ async function runFlow(flow, tabId) {
         }
       } else if (step.type === 'If') {
         await ensureContentScript(tabId);
-        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: {
-          type: 'CheckElement',
-          selector: step.selector,
-          mode: step.mode || 'exists',
-          timeoutMs: step.timeoutMs || 0,
-          textMatch: step.textMatch || 'any',
-          textValue: step.textValue || '',
-          textCaseSensitive: Boolean(step.textCaseSensitive)
-        } });
+        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: buildCheckElementStep(step, settings) });
         const cond = Boolean(res && (res.value === true || (res.ok === true && res.value !== false)));
         try { broadcastToOptions({ type: 'IF_RESULT', index: i, result: cond ? 'then' : 'else' }); } catch {}
         const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
@@ -641,7 +657,7 @@ async function runFlow(flow, tabId) {
         if (step.type === "WaitForEmailGmail") {
           res = await waitForEmailGmail(step);
         } else {
-          res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(step.forceClick) } });
+          res = await chrome.tabs.sendMessage(tabId, { type: "RUN_STEP", step: buildRuntimeStep(step, settings, { forceClick: Boolean(step.forceClick) }) });
         }
         // optional: evaluate res
       }
@@ -674,12 +690,7 @@ async function runFlow(flow, tabId) {
 
 async function runStepsInline(steps, tabId, ctx) {
   if (!Array.isArray(steps) || !steps.length) return;
-  // read settings
-  let settings = { stepDelayMs: 300, selectorWaitMs: 5000, useNativeClick: false };
-  try {
-    const s = await chrome.storage.local.get(["settings"]);
-    settings = { ...settings, ...(s?.settings || {}) };
-  } catch {}
+  const settings = await loadSettings();
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     try {
@@ -721,15 +732,7 @@ async function runStepsInline(steps, tabId, ctx) {
         }
       } else if (step.type === 'If') {
         await ensureContentScript(tabId);
-        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: {
-          type: 'CheckElement',
-          selector: step.selector,
-          mode: step.mode || 'exists',
-          timeoutMs: step.timeoutMs || 0,
-          textMatch: step.textMatch || 'any',
-          textValue: step.textValue || '',
-          textCaseSensitive: Boolean(step.textCaseSensitive)
-        } });
+        const res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: buildCheckElementStep(step, settings) });
         const cond = Boolean(res && (res.value === true || res.ok === true && res.value !== false));
         const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
         if (Array.isArray(branch) && branch.length) {
@@ -771,7 +774,7 @@ async function runStepsInline(steps, tabId, ctx) {
         if (step.type === 'WaitForEmailGmail') {
           res = await waitForEmailGmail(step);
         } else {
-          res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: { ...step, selectorWaitMs: settings.selectorWaitMs, useNativeClick: settings.useNativeClick, forceClick: Boolean(step.forceClick) } });
+          res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: buildRuntimeStep(step, settings, { forceClick: Boolean(step.forceClick) }) });
         }
       }
       if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
