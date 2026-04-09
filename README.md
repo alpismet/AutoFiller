@@ -6,6 +6,13 @@ AutoFiller is a Chrome extension built around a visual flow editor. It lets you 
 
 Project-level agent instructions and Codex docs live at the repository root. The packageable extension itself lives under `extension/`.
 
+Maintainer-facing project memory is split across:
+
+- [docs/MAINTAINER_SYSTEM.md](docs/MAINTAINER_SYSTEM.md)
+- [docs/PROJECT_KNOWLEDGE.md](docs/PROJECT_KNOWLEDGE.md)
+- [docs/PROJECT_MEMORY.md](docs/PROJECT_MEMORY.md)
+- [docs/PROJECT_PRIORITIES.md](docs/PROJECT_PRIORITIES.md)
+
 ## Highlights
 
 - Chrome Extension Manifest V3 architecture
