@@ -13,7 +13,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   stepDelayMs: 300,
   selectorWaitMs: 5000,
   useNativeClick: false,
-  readInsideIframes: true
+  readInsideIframes: true,
+  autoSave: true
 });
 
 let offscreenCreationPromise = null;
@@ -76,6 +77,132 @@ function getRestartOutcome(step) {
   }
   return outcome;
 }
+
+function truncateRuntimeLabel(value, max = 42) {
+  const text = typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function summarizeSelectorLabel(selector, fallback) {
+  const text = truncateRuntimeLabel(selector, 34);
+  if (!text) return fallback;
+  if (text.startsWith("#")) return text;
+  if (text.startsWith(".")) return text;
+  if (text.startsWith("[")) return text;
+  if (text.includes(">>>")) {
+    const parts = text.split(">>>").map((part) => part.trim()).filter(Boolean);
+    return parts[parts.length - 1] || fallback;
+  }
+  return text;
+}
+
+function summarizeUrlLabel(url) {
+  const raw = typeof url === "string" ? url.trim() : "";
+  if (!raw) return "Go to URL";
+  try {
+    const parsed = new URL(raw);
+    const path = parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : "";
+    const summary = truncateRuntimeLabel(`${parsed.hostname}${path}`, 40);
+    return summary ? `Go to ${summary}` : "Go to URL";
+  } catch {
+    const summary = truncateRuntimeLabel(raw, 40);
+    return summary ? `Go to ${summary}` : "Go to URL";
+  }
+}
+
+function summarizeRuntimeStep(step, groupsMap) {
+  if (!step || typeof step !== "object") return "Step";
+  switch (step.type) {
+    case "GoToURL":
+      return summarizeUrlLabel(step.url);
+    case "Click":
+      return `Click element — ${summarizeSelectorLabel(step.selector, "target")}`;
+    case "FillText":
+      return `Fill text — ${summarizeSelectorLabel(step.selector, "target")}`;
+    case "KeyPress": {
+      const keys = Array.isArray(step.keys)
+        ? step.keys
+            .map((combo) => {
+              if (!combo || typeof combo !== "object") return null;
+              const parts = [];
+              if (combo.ctrlKey) parts.push("Ctrl");
+              if (combo.altKey) parts.push("Alt");
+              if (combo.shiftKey) parts.push("Shift");
+              if (combo.metaKey) parts.push("Meta");
+              parts.push(combo.key || combo.code || "Key");
+              return parts.join("+");
+            })
+            .filter(Boolean)
+        : [];
+      const summary = truncateRuntimeLabel(keys.join(" → "), 34);
+      return summary ? `Press keys — ${summary}` : "Press keys";
+    }
+    case "Wait":
+      return `Wait — ${Number(step.ms) || 0} ms`;
+    case "If":
+      return `If — ${summarizeSelectorLabel(step.selector, "condition")}`;
+    case "Restart":
+      return step.mode === "if" ? "Restart — If target" : "Restart — Flow start";
+    case "SelectFiles":
+      return `Select files — ${summarizeSelectorLabel(step.selector, "target")}`;
+    case "SelectDropdown":
+      return `Select dropdown — ${truncateRuntimeLabel(step.optionText, 32) || "option"}`;
+    case "WaitForEmailGmail":
+      return `Wait for email — ${truncateRuntimeLabel(step.subject, 30) || "message"}`;
+    case "Complete":
+      return `Complete flow — ${step.status === "failure" ? "failure" : "success"}`;
+    case "EnsureAudio":
+      return "Ensure audio";
+    case "PlaySound":
+      return "Play sound";
+    case "GroupExecuter": {
+      const name = groupsMap?.get(step.groupId)?.name;
+      return `Run group — ${truncateRuntimeLabel(name || step.groupId || "group", 30)}`;
+    }
+    default:
+      return step.type || "Step";
+  }
+}
+
+function broadcastGroupExecutionStart(groupTracker) {
+  if (!groupTracker || typeof groupTracker.parentIndex !== "number") return;
+  broadcastToOptions({
+    type: "GROUP_EXEC_STATUS",
+    action: "start",
+    parentIndex: groupTracker.parentIndex,
+    groupId: groupTracker.groupId,
+    groupName: groupTracker.groupName,
+    total: groupTracker.total,
+    current: 0,
+    items: groupTracker.items.map((item) => ({ label: item.label, status: item.status, index: item.index }))
+  });
+}
+
+function broadcastGroupExecutionItem(groupTracker, itemIndex, status, current) {
+  if (!groupTracker || typeof groupTracker.parentIndex !== "number") return;
+  broadcastToOptions({
+    type: "GROUP_EXEC_STATUS",
+    action: "item",
+    parentIndex: groupTracker.parentIndex,
+    itemIndex,
+    status,
+    current,
+    total: groupTracker.total
+  });
+}
+
+function broadcastGroupExecutionFinish(groupTracker, status) {
+  if (!groupTracker || typeof groupTracker.parentIndex !== "number") return;
+  broadcastToOptions({
+    type: "GROUP_EXEC_STATUS",
+    action: "finish",
+    parentIndex: groupTracker.parentIndex,
+    status,
+    current: status === "success" ? groupTracker.total : groupTracker.current,
+    total: groupTracker.total
+  });
+}
 const STEP_SANITIZERS = {
   GoToURL(step) {
     const url = typeof step.url === "string" ? step.url.trim() : "";
@@ -103,6 +230,44 @@ const STEP_SANITIZERS = {
     const d = Number(step.slowTypeDelayMs);
     if (Number.isFinite(d) && d >= 0) out.slowTypeDelayMs = d;
     return out;
+  },
+  KeyPress(step) {
+    const rawKeys = Array.isArray(step?.keys) ? step.keys : [];
+    const keys = rawKeys
+      .map((combo) => {
+        if (!combo || typeof combo !== "object") return null;
+        const key = typeof combo.key === "string" ? combo.key.trim() : "";
+        const code = typeof combo.code === "string" ? combo.code.trim() : "";
+        const primary = key || code;
+        if (!primary) return null;
+        return {
+          key: key || primary,
+          code: code || key || primary,
+          ctrlKey: Boolean(combo.ctrlKey),
+          altKey: Boolean(combo.altKey),
+          shiftKey: Boolean(combo.shiftKey),
+          metaKey: Boolean(combo.metaKey)
+        };
+      })
+      .filter(Boolean);
+    if (!keys.length) return null;
+    const repeat = Number(step.repeat);
+    const repeatDelayMs = Number(step.repeatDelayMs);
+    const keyDelayMs = Number(step.keyDelayMs);
+    const holdMs = Number(step.holdMs);
+    return {
+      type: "KeyPress",
+      keys,
+      repeat: Number.isFinite(repeat) && repeat >= 1 ? Math.floor(repeat) : 1,
+      repeatDelayMs: Number.isFinite(repeatDelayMs) && repeatDelayMs >= 0 ? repeatDelayMs : 120,
+      keyDelayMs: Number.isFinite(keyDelayMs) && keyDelayMs >= 0 ? keyDelayMs : 60,
+      holdMs: Number.isFinite(holdMs) && holdMs >= 0 ? holdMs : 0
+    };
+  },
+  GroupExecuter(step) {
+    const groupId = typeof step.groupId === "string" ? step.groupId.trim() : "";
+    if (!groupId) return null;
+    return { type: "GroupExecuter", groupId };
   },
   EnsureAudio(step) {
     const timeout = Number(step.timeoutMs);
@@ -202,7 +367,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         isFlowRunning = true;
         stopRequested = false;
-        const flow = await fetchActiveFlow();
+        const workspace = await fetchActiveWorkspace();
+        const flow = workspace.flow;
         if (!flow.length) {
           throw new Error("Flow is empty. Configure steps in the options page.");
         }
@@ -212,7 +378,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: "No active tab" });
           return;
         }
-        await runFlow(flow, targetTabId);
+        await runFlow(flow, targetTabId, workspace.groups);
         sendResponse({ ok: true });
       } catch (e) {
         console.error("[background] RUN_FLOW error:", e);
@@ -243,8 +409,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         const index = typeof msg.index === "number" ? msg.index : -1;
         if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "running" });
-  const step = sanitizeStep(msg.step) || msg.step;
+        const step = sanitizeStep(msg.step) || msg.step;
         if (!step) { sendResponse({ ok: false, error: "Invalid step" }); if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: "error" }); return; }
+        let executionGroups = sanitizeGroups(msg?.groups);
+        if (!executionGroups.length && (step.type === "GroupExecuter" || step.type === "If")) {
+          const workspace = await fetchActiveWorkspace();
+          executionGroups = workspace.groups;
+        }
 
         if (step.type === "GoToURL") {
           await chrome.tabs.update(targetTabId, { url: step.url });
@@ -262,7 +433,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (remain !== last) {
               last = remain;
               if (index >= 0) {
-                try { broadcastToOptions({ type: 'WAIT_COUNTDOWN', index, seconds: Math.max(0, remain) }); } catch {}
+                try { broadcastToOptions({ type: 'WAIT_COUNTDOWN', index, seconds: Math.max(0, remain), until }); } catch {}
               }
             }
             await wait(250);
@@ -279,7 +450,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           try { if (index >= 0) broadcastToOptions({ type: 'IF_RESULT', index, result: cond ? 'then' : 'else' }); } catch {}
           const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
           if (Array.isArray(branch) && branch.length) {
-            const out = await runStepsInline(branch, targetTabId, { parentIndex: index, branchKey: cond ? 'then' : 'else', path: [index, (cond ? 'then' : 'else')] });
+            const out = await runStepsInline(branch, targetTabId, {
+              parentIndex: index,
+              branchKey: cond ? 'then' : 'else',
+              path: [index, (cond ? 'then' : 'else')],
+              executionContext: createExecutionContext(executionGroups)
+            });
             if (out?.completedOutcome) {
               if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status: out.completedOutcome.outcome === 'failure' ? 'error' : 'success' });
               sendResponse({ ok: true });
@@ -294,6 +470,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           broadcastToOptions({ type: 'FLOW_COMPLETE', outcome, message, index });
           sendResponse({ ok: true });
           return;
+        } else if (step.type === "GroupExecuter") {
+          const executionContext = createExecutionContext(executionGroups);
+          const out = await runGroupById(step.groupId, targetTabId, executionContext, { parentIndex: index });
+          if (out?.completedOutcome) {
+            const status = out.completedOutcome.outcome === "failure" ? "error" : "success";
+            if (index >= 0) broadcastToOptions({ type: "FLOW_STATUS", index, status });
+          }
         } else if (step.type === "WaitForEmailGmail") {
           const res = await waitForEmailGmail(step);
           if (!res?.ok) throw new Error(res?.error || "step_failed");
@@ -413,6 +596,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === "PING_SELECTOR_IN_TAB") {
+    (async () => {
+      try {
+        const targetTabId = msg.tabId || (await getActiveTabId());
+        if (!targetTabId) {
+          sendResponse({ ok: false, error: "No active tab found." });
+          return;
+        }
+        const url = await getTabUrl(targetTabId);
+        if (isForbiddenUrl(url)) {
+          sendResponse({ ok: false, error: "Target page is not scriptable." });
+          return;
+        }
+        const settings = await loadSettings();
+        await ensureContentScript(targetTabId);
+        const res = await chrome.tabs.sendMessage(targetTabId, {
+          type: "PING_SELECTOR",
+          selector: msg.selector,
+          readInsideIframes: msg.readInsideIframes ?? (settings.readInsideIframes !== false)
+        }, { frameId: 0 });
+        sendResponse(res && typeof res === "object" ? res : { ok: false, error: "Unable to ping selector." });
+      } catch (err) {
+        console.warn("[background] Failed to ping selector:", err);
+        sendResponse({ ok: false, error: err?.message || String(err) });
+      }
+    })();
+    return true;
+  }
+
   if (msg.type === "PICKER_RESULT") {
     if (activePicker && (!msg.requestId || msg.requestId === activePicker.requestId)) {
       activePicker = null;
@@ -501,6 +713,210 @@ async function nativeClick(tabId, x, y) {
   }
 }
 
+function keyModifiersMask(combo) {
+  let mask = 0;
+  if (combo.altKey) mask |= 1;
+  if (combo.ctrlKey) mask |= 2;
+  if (combo.metaKey) mask |= 4;
+  if (combo.shiftKey) mask |= 8;
+  return mask;
+}
+
+function keyLocationFromCode(code = "") {
+  if (/Right$/.test(code)) return 2;
+  if (/Left$/.test(code)) return 1;
+  if (/^Numpad/.test(code)) return 3;
+  return 0;
+}
+
+function vkCodeForCombo(combo) {
+  const key = combo.key;
+  const code = combo.code || "";
+  if (/^Key[A-Z]$/.test(code)) return code.charCodeAt(3);
+  if (/^Digit[0-9]$/.test(code)) return code.charCodeAt(5);
+  if (/^F([1-9]|1[0-2])$/.test(code)) return 111 + Number(code.slice(1));
+  if (/^Numpad[0-9]$/.test(code)) return 96 + Number(code.slice(6));
+  const byCode = {
+    Enter: 13,
+    NumpadEnter: 13,
+    Tab: 9,
+    Escape: 27,
+    Space: 32,
+    Backspace: 8,
+    Delete: 46,
+    Insert: 45,
+    Home: 36,
+    End: 35,
+    PageUp: 33,
+    PageDown: 34,
+    ArrowUp: 38,
+    ArrowDown: 40,
+    ArrowLeft: 37,
+    ArrowRight: 39,
+    CapsLock: 20,
+    NumLock: 144,
+    ScrollLock: 145,
+    Pause: 19,
+    PrintScreen: 44,
+    ContextMenu: 93,
+    Minus: 189,
+    Equal: 187,
+    Comma: 188,
+    Period: 190,
+    Slash: 191,
+    Semicolon: 186,
+    Quote: 222,
+    Backquote: 192,
+    Backslash: 220,
+    BracketLeft: 219,
+    BracketRight: 221,
+    NumpadAdd: 107,
+    NumpadSubtract: 109,
+    NumpadMultiply: 106,
+    NumpadDivide: 111,
+    NumpadDecimal: 110,
+    ShiftLeft: 16,
+    ShiftRight: 16,
+    ControlLeft: 17,
+    ControlRight: 17,
+    AltLeft: 18,
+    AltRight: 18,
+    MetaLeft: 91,
+    MetaRight: 92
+  };
+  if (byCode[code]) return byCode[code];
+  const byKey = {
+    Enter: 13,
+    Tab: 9,
+    Escape: 27,
+    " ": 32,
+    Backspace: 8,
+    Delete: 46,
+    Insert: 45,
+    Home: 36,
+    End: 35,
+    PageUp: 33,
+    PageDown: 34,
+    ArrowUp: 38,
+    ArrowDown: 40,
+    ArrowLeft: 37,
+    ArrowRight: 39,
+    CapsLock: 20,
+    NumLock: 144,
+    ScrollLock: 145,
+    Pause: 19,
+    PrintScreen: 44,
+    ContextMenu: 93,
+    Shift: 16,
+    Control: 17,
+    Alt: 18,
+    Meta: 91
+  };
+  if (byKey[key]) return byKey[key];
+  if (typeof key === "string" && key.length === 1) return key.toUpperCase().charCodeAt(0);
+  return 0;
+}
+
+function isPrintableCombo(combo) {
+  const key = combo.key === "Space" ? " " : combo.key;
+  return typeof key === "string" && key.length === 1;
+}
+
+function isEnterLikeCombo(combo) {
+  return combo?.key === "Enter" || combo?.key === "NumpadEnter" || combo?.code === "Enter" || combo?.code === "NumpadEnter";
+}
+
+function shouldUseKeyDownEvent(combo) {
+  return isPrintableCombo(combo) || isEnterLikeCombo(combo);
+}
+
+function shouldEmitCharEvent(combo) {
+  return isPrintableCombo(combo) || isEnterLikeCombo(combo);
+}
+
+function buildKeyEventPayload(combo, modifiersMask) {
+  const key = combo.key === "Space" ? " " : combo.key;
+  const windowsVirtualKeyCode = vkCodeForCombo({ ...combo, key });
+  const location = keyLocationFromCode(combo.code || "");
+  const isKeypad = location === 3;
+  const printable = isPrintableCombo({ ...combo, key });
+  const enterLike = isEnterLikeCombo({ ...combo, key });
+  return {
+    key,
+    code: combo.code || key,
+    windowsVirtualKeyCode,
+    nativeVirtualKeyCode: windowsVirtualKeyCode,
+    modifiers: modifiersMask,
+    location,
+    isKeypad,
+    text: printable ? key : (enterLike ? "\r" : undefined),
+    unmodifiedText: printable ? key : (enterLike ? "\r" : undefined)
+  };
+}
+
+async function dispatchNativeKeyEvent(target, type, payload) {
+  const clean = Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined));
+  await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", { type, ...clean });
+}
+
+async function nativeKeySequence(tabId, keys, options = {}) {
+  const target = { tabId };
+  const repeat = Math.max(1, Math.floor(Number(options.repeat) || 1));
+  const repeatDelayMs = Math.max(0, Number(options.repeatDelayMs) || 0);
+  const keyDelayMs = Math.max(0, Number(options.keyDelayMs) || 0);
+  const holdMs = Math.max(0, Number(options.holdMs) || 0);
+  const modifierDefs = [
+    { flag: "ctrlKey", key: "Control", code: "ControlLeft" },
+    { flag: "altKey", key: "Alt", code: "AltLeft" },
+    { flag: "shiftKey", key: "Shift", code: "ShiftLeft" },
+    { flag: "metaKey", key: "Meta", code: "MetaLeft" }
+  ];
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    for (let cycle = 0; cycle < repeat; cycle += 1) {
+      for (let i = 0; i < keys.length; i += 1) {
+        const combo = keys[i];
+        const activeFlags = new Set();
+        for (const modifier of modifierDefs) {
+          if (!combo[modifier.flag]) continue;
+          activeFlags.add(modifier.flag);
+          await dispatchNativeKeyEvent(target, "rawKeyDown", buildKeyEventPayload(modifier, keyModifiersMask({
+            ctrlKey: activeFlags.has("ctrlKey"),
+            altKey: activeFlags.has("altKey"),
+            shiftKey: activeFlags.has("shiftKey"),
+            metaKey: activeFlags.has("metaKey")
+          })));
+        }
+
+        const payload = buildKeyEventPayload(combo, keyModifiersMask(combo));
+        await dispatchNativeKeyEvent(target, shouldUseKeyDownEvent(combo) ? "keyDown" : "rawKeyDown", payload);
+        if (shouldEmitCharEvent(combo)) {
+          await dispatchNativeKeyEvent(target, "char", payload);
+        }
+        if (holdMs > 0) await wait(holdMs);
+        await dispatchNativeKeyEvent(target, "keyUp", payload);
+
+        for (let j = modifierDefs.length - 1; j >= 0; j -= 1) {
+          const modifier = modifierDefs[j];
+          if (!combo[modifier.flag]) continue;
+          activeFlags.delete(modifier.flag);
+          await dispatchNativeKeyEvent(target, "keyUp", buildKeyEventPayload(modifier, keyModifiersMask({
+            ctrlKey: activeFlags.has("ctrlKey"),
+            altKey: activeFlags.has("altKey"),
+            shiftKey: activeFlags.has("shiftKey"),
+            metaKey: activeFlags.has("metaKey")
+          })));
+        }
+
+        if (keyDelayMs > 0 && i < keys.length - 1) await wait(keyDelayMs);
+      }
+      if (repeatDelayMs > 0 && cycle < repeat - 1) await wait(repeatDelayMs);
+    }
+  } finally {
+    try { await chrome.debugger.detach(target); } catch {}
+  }
+}
+
 // Handle native click requests from content
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "NATIVE_CLICK" && sender?.tab?.id && typeof msg.x === "number" && typeof msg.y === "number") {
@@ -510,6 +926,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true });
       } catch (e) {
         sendResponse({ ok: false, error: String(e) });
+      }
+    })();
+    return true;
+  }
+  if (msg?.type === "NATIVE_KEYPRESS" && sender?.tab?.id && Array.isArray(msg.keys) && msg.keys.length) {
+    (async () => {
+      try {
+        await nativeKeySequence(sender.tab.id, msg.keys, {
+          repeat: msg.repeat,
+          repeatDelayMs: msg.repeatDelayMs,
+          keyDelayMs: msg.keyDelayMs,
+          holdMs: msg.holdMs
+        });
+        sendResponse({ ok: true });
+      } catch (e) {
+        console.warn("[background] nativeKeySequence failed:", e);
+        sendResponse({ ok: false, error: String(e?.message || e) });
       }
     })();
     return true;
@@ -550,8 +983,9 @@ async function ensureContentScript(tabId) {
   }
 }
 
-async function runFlow(flow, tabId) {
+async function runFlow(flow, tabId, groups = []) {
   const settings = await loadSettings();
+  const executionContext = createExecutionContext(groups);
 
   // notify options to reset statuses
   broadcastToOptions({ type: "FLOW_STATUS", kind: "FLOW_RESET" });
@@ -580,7 +1014,7 @@ async function runFlow(flow, tabId) {
           const remain = Math.ceil((until - Date.now()) / 1000);
           if (remain !== last) {
             last = remain;
-            try { broadcastToOptions({ type: 'WAIT_COUNTDOWN', index: i, seconds: Math.max(0, remain) }); } catch {}
+            try { broadcastToOptions({ type: 'WAIT_COUNTDOWN', index: i, seconds: Math.max(0, remain), until }); } catch {}
           }
           if (stopRequested) throw new Error('aborted');
           await wait(250);
@@ -611,7 +1045,7 @@ async function runFlow(flow, tabId) {
         try { broadcastToOptions({ type: 'IF_RESULT', index: i, result: cond ? 'then' : 'else' }); } catch {}
         const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
         if (Array.isArray(branch) && branch.length) {
-          const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else', path: [i, (cond ? 'then' : 'else')] });
+          const outcome = await runStepsInline(branch, tabId, { parentIndex: i, branchKey: cond ? 'then' : 'else', path: [i, (cond ? 'then' : 'else')], executionContext });
           if (outcome?.completedOutcome) {
             completedOutcome = outcome.completedOutcome;
             completedCountsAsRun = outcome.completedOutcome.outcome === 'success';
@@ -651,6 +1085,36 @@ async function runFlow(flow, tabId) {
         completedOutcome = { outcome, message };
         completedCountsAsRun = outcome === 'success';
         break;
+      } else if (step.type === "GroupExecuter") {
+        const outcome = await runGroupById(step.groupId, tabId, executionContext, { parentIndex: i });
+        if (outcome?.completedOutcome) {
+          completedOutcome = outcome.completedOutcome;
+          completedCountsAsRun = outcome.completedOutcome.outcome === "success";
+          broadcastToOptions({ type: "FLOW_STATUS", index: i, status: outcome.completedOutcome.outcome === "failure" ? "error" : "success" });
+          break;
+        }
+        if (outcome?.restartRequested) {
+          if (outcome.targetDepth != null && outcome.targetDepth > 1) {
+            broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+            iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
+            i = -1;
+            continue;
+          }
+          if (outcome.targetDepth != null && outcome.targetDepth <= 1) {
+            i -= 1;
+            continue;
+          }
+          if (Number.isFinite(outcome.jumpToIfIndex) && outcome.jumpToIfIndex >= 0 && outcome.jumpToIfIndex < flow.length && flow[outcome.jumpToIfIndex]?.type === 'If') {
+            broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+            iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
+            i = outcome.jumpToIfIndex - 1;
+            continue;
+          }
+          broadcastToOptions({ type: 'FLOW_STATUS', kind: 'FLOW_RESET' });
+          iterCount += 1; try { broadcastToOptions({ type: 'FLOW_ITER', count: iterCount }); } catch {}
+          i = -1;
+          continue;
+        }
       } else {
         await ensureContentScript(tabId);
         let res = null;
@@ -691,8 +1155,16 @@ async function runFlow(flow, tabId) {
 async function runStepsInline(steps, tabId, ctx) {
   if (!Array.isArray(steps) || !steps.length) return;
   const settings = await loadSettings();
+  const executionContext = ctx?.executionContext || createExecutionContext([]);
+  const groupTracker = ctx?.groupTracker || null;
+  const groupLevel = Number.isFinite(ctx?.groupLevel) ? ctx.groupLevel : 0;
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
+    if (groupTracker && groupLevel === 0) {
+      groupTracker.current = i + 1;
+      if (groupTracker.items[i]) groupTracker.items[i].status = 'running';
+      broadcastGroupExecutionItem(groupTracker, i, 'running', groupTracker.current);
+    }
     try {
       if (stopRequested) throw new Error('aborted');
       if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
@@ -715,7 +1187,7 @@ async function runStepsInline(steps, tabId, ctx) {
             last = remain;
             if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
               const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
-              try { broadcastToOptions({ type: 'WAIT_NESTED_COUNTDOWN', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, seconds: Math.max(0, remain) }); } catch {}
+              try { broadcastToOptions({ type: 'WAIT_NESTED_COUNTDOWN', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, seconds: Math.max(0, remain), until }); } catch {}
             }
           }
           if (stopRequested) throw new Error('aborted');
@@ -737,7 +1209,7 @@ async function runStepsInline(steps, tabId, ctx) {
         const branch = cond ? (Array.isArray(step.then) ? step.then : []) : (Array.isArray(step.else) ? step.else : []);
         if (Array.isArray(branch) && branch.length) {
           const branchPath = Array.isArray(ctx.path) ? ctx.path.concat(i, (cond ? 'then' : 'else')) : [ctx.parentIndex, ctx.branchKey || 'then', i, (cond ? 'then' : 'else')];
-          const outcome = await runStepsInline(branch, tabId, { ...ctx, path: branchPath });
+          const outcome = await runStepsInline(branch, tabId, { ...ctx, path: branchPath, executionContext, groupTracker, groupLevel: groupLevel + 1 });
           if (outcome?.completedOutcome) {
             if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
               const selfPath = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
@@ -768,6 +1240,10 @@ async function runStepsInline(steps, tabId, ctx) {
         }
         broadcastToOptions({ type: 'FLOW_COMPLETE', outcome, message, index: typeof ctx?.parentIndex === 'number' ? ctx.parentIndex : null, path });
         return { completedOutcome: { outcome, message } };
+      } else if (step.type === "GroupExecuter") {
+        const outcome = await runGroupById(step.groupId, tabId, executionContext);
+        if (outcome?.completedOutcome) return outcome;
+        if (outcome?.restartRequested) return outcome;
       } else {
         await ensureContentScript(tabId);
         let res = null;
@@ -777,6 +1253,10 @@ async function runStepsInline(steps, tabId, ctx) {
           res = await chrome.tabs.sendMessage(tabId, { type: 'RUN_STEP', step: buildRuntimeStep(step, settings, { forceClick: Boolean(step.forceClick) }) });
         }
       }
+      if (groupTracker && groupLevel === 0) {
+        if (groupTracker.items[i]) groupTracker.items[i].status = 'success';
+        broadcastGroupExecutionItem(groupTracker, i, 'success', groupTracker.current);
+      }
       if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
         const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
         try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, status: 'success' }); } catch {}
@@ -785,13 +1265,15 @@ async function runStepsInline(steps, tabId, ctx) {
       if (delay > 0) await wait(delay);
     } catch (err) {
       console.warn('[background] runStepsInline step failed:', err);
+      if (groupTracker && groupLevel === 0) {
+        if (groupTracker.items[i]) groupTracker.items[i].status = 'error';
+        broadcastGroupExecutionItem(groupTracker, i, 'error', groupTracker.current);
+      }
       if (ctx && (typeof ctx.parentIndex === 'number' || Array.isArray(ctx.path))) {
         const path = Array.isArray(ctx.path) ? ctx.path.concat(i) : [ctx.parentIndex, ctx.branchKey || 'then', i];
         try { broadcastToOptions({ type: 'FLOW_NESTED_STATUS', parentIndex: ctx.parentIndex, branch: ctx.branchKey || 'then', childIndex: i, path, status: 'error' }); } catch {}
       }
-      // continue or break? We mimic main runFlow behavior: continue
-      const delay = Number(settings.stepDelayMs) || 0;
-      if (delay > 0) await wait(delay);
+      throw err;
     }
   }
 }
@@ -1079,15 +1561,80 @@ function waitForTabLoad(tabId) {
   });
 }
 
-async function fetchActiveFlow() {
+function sanitizeGroups(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((group, index) => {
+      if (!group || typeof group !== "object") return null;
+      const id = typeof group.id === "string" ? group.id.trim() : "";
+      if (!id) return null;
+      const name = typeof group.name === "string" && group.name.trim() ? group.name.trim() : `Group ${index + 1}`;
+      return { id, name, steps: sanitizeFlowArray(group.steps) };
+    })
+    .filter(Boolean);
+}
+
+function createExecutionContext(groups) {
+  return {
+    groups: new Map((Array.isArray(groups) ? groups : []).map((group) => [group.id, group])),
+    stack: []
+  };
+}
+
+async function runGroupById(groupId, tabId, executionContext, meta = {}) {
+  const targetId = typeof groupId === "string" ? groupId.trim() : "";
+  if (!targetId) throw new Error("GroupExecuter step is missing a group.");
+  const group = executionContext.groups.get(targetId);
+  if (!group) throw new Error(`Group not found: ${targetId}`);
+  if (executionContext.stack.includes(targetId)) {
+    const chain = executionContext.stack.concat(targetId).join(" -> ");
+    throw new Error(`Recursive group execution is not allowed (${chain}).`);
+  }
+  const groupTracker = typeof meta.parentIndex === "number"
+    ? {
+        parentIndex: meta.parentIndex,
+        groupId: targetId,
+        groupName: group.name,
+        current: 0,
+        total: Array.isArray(group.steps) ? group.steps.length : 0,
+        items: (Array.isArray(group.steps) ? group.steps : []).map((step, index) => ({
+          index,
+          label: summarizeRuntimeStep(step, executionContext.groups),
+          status: 'idle'
+        }))
+      }
+    : null;
+  if (groupTracker) broadcastGroupExecutionStart(groupTracker);
+  executionContext.stack.push(targetId);
   try {
-    const { activeFlow } = await chrome.storage.local.get("activeFlow");
+    const result = await runStepsInline(group.steps, tabId, { executionContext, groupTracker, groupLevel: 0 });
+    if (groupTracker) {
+      const finishStatus = result?.completedOutcome?.outcome === 'failure'
+        ? 'error'
+        : (result?.completedOutcome?.outcome === 'success' ? 'success' : (result?.restartRequested ? 'running' : 'success'));
+      broadcastGroupExecutionFinish(groupTracker, finishStatus);
+    }
+    return result;
+  } catch (err) {
+    if (groupTracker) {
+      broadcastGroupExecutionFinish(groupTracker, 'error');
+    }
+    throw err;
+  } finally {
+    executionContext.stack.pop();
+  }
+}
+
+async function fetchActiveWorkspace() {
+  try {
+    const { activeFlow, groups } = await chrome.storage.local.get(["activeFlow", "groups"]);
     const sanitized = sanitizeFlowArray(activeFlow);
-    if (sanitized.length) return sanitized;
+    const sanitizedGroups = sanitizeGroups(groups);
+    if (sanitized.length) return { flow: sanitized, groups: sanitizedGroups };
   } catch (err) {
     console.warn("[background] Failed to load stored flow, falling back to default:", err);
   }
-  return [...DEFAULT_FLOW];
+  return { flow: [...DEFAULT_FLOW], groups: [] };
 }
 
 function sanitizeFlowArray(value) {
@@ -1179,7 +1726,9 @@ async function mirrorUiStateToStorage(payload) {
         ui.nestedStatuses = {};
         ui.ifResults = {};
         ui.waitCountdowns = {};
+        ui.waitDeadlines = {};
         ui.nestedWaitCountdowns = {};
+        ui.nestedWaitDeadlines = {};
         ui.isRunning = true;
       } else if (typeof payload.index === 'number' && payload.status) {
         const arr = Array.isArray(ui.stepStatuses) ? ui.stepStatuses.slice() : [];
@@ -1187,6 +1736,7 @@ async function mirrorUiStateToStorage(payload) {
         ui.stepStatuses = arr;
         if (payload.status === 'success' || payload.status === 'error') {
           if (ui.waitCountdowns) delete ui.waitCountdowns[payload.index];
+          if (ui.waitDeadlines) delete ui.waitDeadlines[payload.index];
         }
       }
     } else if (payload?.type === 'FLOW_NESTED_STATUS') {
@@ -1197,6 +1747,7 @@ async function mirrorUiStateToStorage(payload) {
         ui.nestedStatuses = map;
         if (payload.status === 'success' || payload.status === 'error') {
           if (ui.nestedWaitCountdowns) delete ui.nestedWaitCountdowns[key];
+          if (ui.nestedWaitDeadlines) delete ui.nestedWaitDeadlines[key];
         }
       }
     } else if (payload?.type === 'IF_RESULT') {
@@ -1210,6 +1761,9 @@ async function mirrorUiStateToStorage(payload) {
         const map = { ...(ui.waitCountdowns || {}) };
         map[payload.index] = Math.max(0, Number(payload.seconds) || 0);
         ui.waitCountdowns = map;
+        const deadlineMap = { ...(ui.waitDeadlines || {}) };
+        if (Number.isFinite(Number(payload.until))) deadlineMap[payload.index] = Number(payload.until);
+        ui.waitDeadlines = deadlineMap;
       }
     } else if (payload?.type === 'WAIT_NESTED_COUNTDOWN') {
       const key = Array.isArray(payload.path) ? payload.path.map(String).join('|') : (typeof payload.parentIndex === 'number' && typeof payload.childIndex === 'number' && typeof payload.branch === 'string' ? `${payload.parentIndex}|${payload.branch}|${payload.childIndex}` : null);
@@ -1217,6 +1771,9 @@ async function mirrorUiStateToStorage(payload) {
         const map = { ...(ui.nestedWaitCountdowns || {}) };
         map[key] = Math.max(0, Number(payload.seconds) || 0);
         ui.nestedWaitCountdowns = map;
+        const deadlineMap = { ...(ui.nestedWaitDeadlines || {}) };
+        if (Number.isFinite(Number(payload.until))) deadlineMap[key] = Number(payload.until);
+        ui.nestedWaitDeadlines = deadlineMap;
       }
     } else if (payload?.type === 'FLOW_ITER') {
       // Persistently increment total completed runs
@@ -1230,6 +1787,10 @@ async function mirrorUiStateToStorage(payload) {
       } catch {}
     } else if (payload?.type === 'FLOW_ABORT') {
       ui.isRunning = false;
+      ui.waitCountdowns = {};
+      ui.waitDeadlines = {};
+      ui.nestedWaitCountdowns = {};
+      ui.nestedWaitDeadlines = {};
     }
     await chrome.storage.local.set({ [key]: ui });
   } catch (err) {

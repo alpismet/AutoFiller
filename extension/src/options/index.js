@@ -10,7 +10,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   stepDelayMs: 300,
   selectorWaitMs: 5000,
   useNativeClick: false,
-  readInsideIframes: true
+  readInsideIframes: true,
+  autoSave: true
 });
 
 const RUN_STATUS_META = {
@@ -21,7 +22,7 @@ const RUN_STATUS_META = {
   error: { icon: "⚠️", label: "Error", className: "status-error" }
 };
 
-const STEP_LIBRARY = [
+const STEP_LIBRARY_BASE = [
   {
     type: "GoToURL",
     label: "Go to URL",
@@ -99,6 +100,26 @@ const STEP_LIBRARY = [
     ]
   },
   {
+    type: "KeyPress",
+    label: "Press keys",
+    description: "Send one or more key presses or shortcuts to the page.",
+    fields: [
+      { key: "keys", label: "Key sequence", type: "keysequence", required: true, default: [] },
+      { key: "repeat", label: "Repeat count", type: "number", min: 1, step: 1, default: 1 },
+      { key: "repeatDelayMs", label: "Delay between repeats (ms)", type: "number", min: 0, step: 10, default: 120 },
+      { key: "keyDelayMs", label: "Delay between keys (ms)", type: "number", min: 0, step: 10, default: 60 },
+      { key: "holdMs", label: "Hold key combo (ms)", type: "number", min: 0, step: 10, default: 0 }
+    ]
+  },
+  {
+    type: "GroupExecuter",
+    label: "Group Executer",
+    description: "Execute a reusable group inline at this point in the flow.",
+    fields: [
+      { key: "groupId", label: "Group", type: "select", required: true, options: [] }
+    ]
+  },
+  {
     type: "Wait",
     label: "Wait",
     description: "Pause the flow for a number of milliseconds.",
@@ -158,6 +179,36 @@ const STEP_LIBRARY = [
   }
 ];
 
+const STEP_LIBRARY_PREFERRED_ORDER = [
+  "Click",
+  "FillText",
+  "KeyPress",
+  "GroupExecuter",
+  "SelectDropdown",
+  "Wait",
+  "GoToURL",
+  "If",
+  "SelectFiles",
+  "WaitForEmailGmail",
+  "EnsureAudio",
+  "PlaySound",
+  "Restart",
+  "Complete"
+];
+
+const STEP_LIBRARY_PRIORITY = new Map(
+  STEP_LIBRARY_PREFERRED_ORDER.map((type, index) => [type, index])
+);
+
+const STEP_LIBRARY = STEP_LIBRARY_BASE.slice().sort((left, right) => {
+  const leftPriority = STEP_LIBRARY_PRIORITY.get(left.type);
+  const rightPriority = STEP_LIBRARY_PRIORITY.get(right.type);
+  const leftRank = Number.isFinite(leftPriority) ? leftPriority : Number.MAX_SAFE_INTEGER;
+  const rightRank = Number.isFinite(rightPriority) ? rightPriority : Number.MAX_SAFE_INTEGER;
+  if (leftRank !== rightRank) return leftRank - rightRank;
+  return left.label.localeCompare(right.label);
+});
+
 const STEP_LIBRARY_MAP = new Map(STEP_LIBRARY.map((step) => [step.type, step]));
 
 const els = {
@@ -175,19 +226,36 @@ const els = {
   status: document.getElementById("status"),
   stepTemplate: document.getElementById("step-template"),
   flowName: document.getElementById("flowName"),
+  flowNameWrap: document.getElementById("flowNameWrap"),
+  topBar: document.getElementById("topBar"),
   // tabs
   tabFlowBtn: document.getElementById("tabFlowBtn"),
+  tabGroupsBtn: document.getElementById("tabGroupsBtn"),
   tabSettingsBtn: document.getElementById("tabSettingsBtn"),
   tabLibraryBtn: document.getElementById("tabLibraryBtn"),
   tabsNav: document.getElementById("tabsNav"),
   tabFlow: document.getElementById("tab-flow"),
+  tabGroups: document.getElementById("tab-groups"),
   tabSettings: document.getElementById("tab-settings"),
   tabLibrary: document.getElementById("tab-library"),
+  groupsListView: document.getElementById("groupsListView"),
+  groupsContainer: document.getElementById("groupsContainer"),
+  groupsEmptyState: document.getElementById("groupsEmptyState"),
+  createGroupBtn: document.getElementById("createGroupBtn"),
+  groupEditorView: document.getElementById("groupEditorView"),
+  closeGroupEditorBtn: document.getElementById("closeGroupEditorBtn"),
+  groupNameInput: document.getElementById("groupNameInput"),
+  groupMeta: document.getElementById("groupMeta"),
+  openTransferModalBtn: document.getElementById("openTransferModalBtn"),
+  groupStepsContainer: document.getElementById("groupStepsContainer"),
+  groupEmptyState: document.getElementById("groupEmptyState"),
+  groupAddStep: document.getElementById("groupAddStep"),
   // settings controls
   stepDelayMs: document.getElementById("stepDelayMs"),
   selectorWaitMs: document.getElementById("selectorWaitMs"),
   useNativeClick: document.getElementById("useNativeClick"),
   readInsideIframes: document.getElementById("readInsideIframes"),
+  autoSave: document.getElementById("autoSave"),
   gmailClientId: document.getElementById("gmailClientId"),
   connectGmailBtn: document.getElementById("connectGmailBtn"),
   testWaitForEmailGmailBtn: document.getElementById("testWaitForEmailGmailBtn"),
@@ -203,30 +271,212 @@ const els = {
   menuReset: document.getElementById("menuReset"),
   menuExport: document.getElementById("menuExport"),
   menuImport: document.getElementById("menuImport"),
-  menuClear: document.getElementById("menuClear")
+  menuClear: document.getElementById("menuClear"),
+  transferModal: document.getElementById("transferModal"),
+  closeTransferModalBtn: document.getElementById("closeTransferModalBtn"),
+  transferSourceSelect: document.getElementById("transferSourceSelect"),
+  transferModeCopyBtn: document.getElementById("transferModeCopyBtn"),
+  transferModeCutBtn: document.getElementById("transferModeCutBtn"),
+  transferSelectionSummary: document.getElementById("transferSelectionSummary"),
+  transferSelectAllBtn: document.getElementById("transferSelectAllBtn"),
+  transferClearSelectionBtn: document.getElementById("transferClearSelectionBtn"),
+  transferSourceList: document.getElementById("transferSourceList"),
+  executeTransferBtn: document.getElementById("executeTransferBtn")
 };
 
 const state = {
   steps: [],
+  mainSteps: [],
   flowName: DEFAULT_FLOW_NAME,
+  groups: [],
   dirty: false,
-  lastSaved: { steps: [], flowName: DEFAULT_FLOW_NAME },
+  lastSaved: { steps: [], flowName: DEFAULT_FLOW_NAME, groups: [] },
   statusTimer: null,
   pendingPicker: null,
   settings: { ...DEFAULT_SETTINGS },
   stepStatuses: [], /* array of 'idle|pending|running|success|error' per step */
   nestedStatuses: {}, /* key "parentIndex|branch|childIndex" -> status */
   ifResults: {}, /* index -> 'then'|'else' */
+  groupExecStates: {}, /* top-level GroupExecuter index -> runtime details */
   waitCountdowns: {}, /* index -> seconds */
+  waitDeadlines: {}, /* index -> epoch ms */
   nestedWaitCountdowns: {} /* "parent|branch|child" -> seconds */,
+  nestedWaitDeadlines: {}, /* "parent|branch|child" -> epoch ms */
   runCount: 0,
   savedFlows: [],
   lastRunIncremented: false,
   stopSuppressUntil: 0,
-  inlineInsertActive: false
+  inlineInsertActive: false,
+  activeTab: "flow",
+  selectedGroupId: null,
+  transferModal: {
+    open: false,
+    mode: "copy",
+    source: "main",
+    selectedIndices: []
+  },
+  groupStepJumpTarget: null,
+  autosaveTimer: null,
+  countdownTicker: null
 };
 
 const PICKER_STATUS_TEXT = "Element picker active – click the target element or press Esc to cancel.";
+let activeKeyCapture = null;
+
+const KEY_PRESS_DROPDOWN_OPTIONS = (() => {
+  const options = [];
+  for (let i = 65; i <= 90; i += 1) {
+    const letter = String.fromCharCode(i);
+    options.push({ label: letter, key: letter.toLowerCase(), code: `Key${letter}` });
+  }
+  for (let i = 0; i <= 9; i += 1) {
+    options.push({ label: String(i), key: String(i), code: `Digit${i}` });
+  }
+  [
+    ["Enter", "Enter", "Enter"],
+    ["Tab", "Tab", "Tab"],
+    ["Escape", "Escape", "Escape"],
+    ["Space", " ", "Space"],
+    ["Backspace", "Backspace", "Backspace"],
+    ["Delete", "Delete", "Delete"],
+    ["Insert", "Insert", "Insert"],
+    ["Home", "Home", "Home"],
+    ["End", "End", "End"],
+    ["Page Up", "PageUp", "PageUp"],
+    ["Page Down", "PageDown", "PageDown"],
+    ["Arrow Up", "ArrowUp", "ArrowUp"],
+    ["Arrow Down", "ArrowDown", "ArrowDown"],
+    ["Arrow Left", "ArrowLeft", "ArrowLeft"],
+    ["Arrow Right", "ArrowRight", "ArrowRight"],
+    ["Caps Lock", "CapsLock", "CapsLock"],
+    ["Num Lock", "NumLock", "NumLock"],
+    ["Scroll Lock", "ScrollLock", "ScrollLock"],
+    ["Pause", "Pause", "Pause"],
+    ["Print Screen", "PrintScreen", "PrintScreen"],
+    ["Menu", "ContextMenu", "ContextMenu"],
+    ["Minus (-)", "-", "Minus"],
+    ["Equal (=)", "=", "Equal"],
+    ["Comma (,)", ",", "Comma"],
+    ["Period (.)", ".", "Period"],
+    ["Slash (/)", "/", "Slash"],
+    ["Semicolon (;)", ";", "Semicolon"],
+    ["Quote (')", "'", "Quote"],
+    ["Backquote (`)", "`", "Backquote"],
+    ["Backslash (\\)", "\\", "Backslash"],
+    ["Left Bracket ([)", "[", "BracketLeft"],
+    ["Right Bracket (])", "]", "BracketRight"],
+    ["Numpad 0", "0", "Numpad0"],
+    ["Numpad 1", "1", "Numpad1"],
+    ["Numpad 2", "2", "Numpad2"],
+    ["Numpad 3", "3", "Numpad3"],
+    ["Numpad 4", "4", "Numpad4"],
+    ["Numpad 5", "5", "Numpad5"],
+    ["Numpad 6", "6", "Numpad6"],
+    ["Numpad 7", "7", "Numpad7"],
+    ["Numpad 8", "8", "Numpad8"],
+    ["Numpad 9", "9", "Numpad9"],
+    ["Numpad +", "+", "NumpadAdd"],
+    ["Numpad -", "-", "NumpadSubtract"],
+    ["Numpad *", "*", "NumpadMultiply"],
+    ["Numpad /", "/", "NumpadDivide"],
+    ["Numpad .", ".", "NumpadDecimal"],
+    ["Numpad Enter", "Enter", "NumpadEnter"],
+    ["Shift", "Shift", "ShiftLeft"],
+    ["Control", "Control", "ControlLeft"],
+    ["Alt", "Alt", "AltLeft"],
+    ["Meta / Command", "Meta", "MetaLeft"]
+  ].forEach(([label, key, code]) => options.push({ label, key, code }));
+  for (let i = 1; i <= 12; i += 1) {
+    options.push({ label: `F${i}`, key: `F${i}`, code: `F${i}` });
+  }
+  return options;
+})();
+
+const KEY_OPTION_MAP = new Map(KEY_PRESS_DROPDOWN_OPTIONS.map((item) => [item.code, item]));
+
+function isModifierKeyValue(value) {
+  return ["Shift", "Control", "Alt", "Meta"].includes(value);
+}
+
+function normalizeKeyCombo(combo) {
+  if (!combo || typeof combo !== "object") return null;
+  const key = typeof combo.key === "string" ? combo.key : "";
+  const code = typeof combo.code === "string" ? combo.code : "";
+  if (!key && !code) return null;
+  const normalized = {
+    key: key || code,
+    code: code || key,
+    ctrlKey: Boolean(combo.ctrlKey),
+    altKey: Boolean(combo.altKey),
+    shiftKey: Boolean(combo.shiftKey),
+    metaKey: Boolean(combo.metaKey)
+  };
+  if (normalized.key === "Control") normalized.ctrlKey = false;
+  if (normalized.key === "Alt") normalized.altKey = false;
+  if (normalized.key === "Shift") normalized.shiftKey = false;
+  if (normalized.key === "Meta") normalized.metaKey = false;
+  return normalized;
+}
+
+function normalizeKeySequence(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((combo) => normalizeKeyCombo(combo)).filter(Boolean);
+}
+
+function formatKeyCombo(combo) {
+  const normalized = normalizeKeyCombo(combo);
+  if (!normalized) return "";
+  const parts = [];
+  if (normalized.ctrlKey) parts.push("Ctrl");
+  if (normalized.altKey) parts.push("Alt");
+  if (normalized.shiftKey) parts.push("Shift");
+  if (normalized.metaKey) parts.push("Meta");
+  const option = KEY_OPTION_MAP.get(normalized.code);
+  let primary = option?.label || normalized.key || normalized.code;
+  if (primary === " ") primary = "Space";
+  if (primary.length === 1) primary = primary.toUpperCase();
+  parts.push(primary);
+  return parts.filter(Boolean).join(" + ");
+}
+
+function stopActiveKeyCapture() {
+  if (!activeKeyCapture) return;
+  try { window.removeEventListener("keydown", activeKeyCapture.keydown, true); } catch {}
+  try { window.removeEventListener("blur", activeKeyCapture.blur, true); } catch {}
+  const { button } = activeKeyCapture;
+  if (button?.isConnected) {
+    button.classList.remove("active");
+    button.textContent = "Capture";
+  }
+  activeKeyCapture = null;
+}
+
+function beginKeyCapture(button, onCaptured) {
+  stopActiveKeyCapture();
+  if (!button) return;
+  button.classList.add("active");
+  button.textContent = "Press key…";
+  const keydown = (event) => {
+    if (event.repeat) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    const combo = normalizeKeyCombo({
+      key: event.key,
+      code: event.code || event.key,
+      ctrlKey: event.ctrlKey,
+      altKey: event.altKey,
+      shiftKey: event.shiftKey,
+      metaKey: event.metaKey
+    });
+    stopActiveKeyCapture();
+    if (combo) onCaptured(combo);
+  };
+  const blur = () => stopActiveKeyCapture();
+  activeKeyCapture = { button, keydown, blur };
+  window.addEventListener("keydown", keydown, true);
+  window.addEventListener("blur", blur, true);
+}
 
 function getExtensionVersion() {
   try {
@@ -234,6 +484,413 @@ function getExtensionVersion() {
   } catch {
     return "";
   }
+}
+
+function deepClone(value) {
+  if (typeof structuredClone === "function") {
+    try {
+      return structuredClone(value);
+    } catch {}
+  }
+  return JSON.parse(JSON.stringify(value));
+}
+
+function cloneFlow(flow) {
+  return Array.isArray(flow) ? deepClone(flow) : [];
+}
+
+function sanitizeGroups(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((group, index) => {
+      if (!group || typeof group !== "object") return null;
+      const id = typeof group.id === "string" && group.id.trim() ? group.id.trim() : `grp_import_${index}_${Math.random().toString(16).slice(2, 8)}`;
+      const name = typeof group.name === "string" && group.name.trim() ? group.name.trim() : `Group ${index + 1}`;
+      return {
+        id,
+        name,
+        steps: sanitizeFlowArray(group.steps)
+      };
+    })
+    .filter(Boolean);
+}
+
+function createGroup(name = "New Group") {
+  return {
+    id: `grp_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
+    name,
+    steps: []
+  };
+}
+
+function buildGroupOptions({ includePlaceholder = false } = {}) {
+  const options = state.groups.map((group) => ({ value: group.id, label: group.name }));
+  if (includePlaceholder && !options.length) {
+    return [{ value: "", label: "(no groups available)" }];
+  }
+  return options;
+}
+
+function summarizeStep(step, index) {
+  const schema = STEP_LIBRARY_MAP.get(step?.type);
+  const label = schema?.label || step?.type || "Step";
+  const parts = [`${index + 1}. ${label}`];
+  if (step?.type === "Click" && step.selector) parts.push(step.selector);
+  if (step?.type === "FillText" && step.selector) parts.push(step.selector);
+  if (step?.type === "GoToURL" && step.url) parts.push(step.url);
+  if (step?.type === "KeyPress" && Array.isArray(step.keys) && step.keys.length) {
+    parts.push(step.keys.map(formatKeyCombo).join(" → "));
+  }
+  if (step?.type === "GroupExecuter") {
+    const group = state.groups.find((item) => item.id === step.groupId);
+    parts.push(group?.name || "Unassigned group");
+  }
+  return parts.filter(Boolean).join(" — ");
+}
+
+function sanitizeSavedFlows(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item, index) => {
+      if (!item || typeof item !== "object") return null;
+      const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : `Flow ${index + 1}`;
+      const flowName = typeof item.flowName === "string" && item.flowName.trim()
+        ? item.flowName.trim()
+        : name;
+      return {
+        id: typeof item.id === "string" && item.id.trim() ? item.id : `sf_${Date.now()}_${index}`,
+        name,
+        flowName,
+        steps: sanitizeFlowArray(item.steps),
+        groups: sanitizeGroups(item.groups),
+        updatedAt: Number(item.updatedAt) || Date.now()
+      };
+    })
+    .filter(Boolean);
+}
+
+function getSelectedGroup() {
+  return state.groups.find((group) => group.id === state.selectedGroupId) || null;
+}
+
+function isEditingGroup() {
+  return state.activeTab === "groups" && Boolean(state.selectedGroupId);
+}
+
+function syncEditorSteps() {
+  const group = getSelectedGroup();
+  if (isEditingGroup() && group) {
+    state.steps = group.steps;
+    return;
+  }
+  state.steps = state.mainSteps;
+}
+
+function buildDraftWorkspacePayload() {
+  return {
+    flowName: state.flowName,
+    steps: cloneFlow(state.mainSteps),
+    groups: deepClone(state.groups),
+    selectedTab: state.activeTab || "flow",
+    selectedGroupId: state.selectedGroupId || null
+  };
+}
+
+function snapshotAsSaved() {
+  state.lastSaved = {
+    steps: cloneFlow(state.mainSteps),
+    flowName: state.flowName,
+    groups: deepClone(state.groups)
+  };
+}
+
+function restoreLastSaved() {
+  state.mainSteps = cloneFlow(state.lastSaved.steps);
+  state.groups = deepClone(state.lastSaved.groups || []);
+  state.flowName = state.lastSaved.flowName;
+  if (state.selectedGroupId && !getSelectedGroup()) {
+    state.selectedGroupId = null;
+  }
+  syncEditorSteps();
+}
+
+function markWorkspaceDirty(flag, { silent } = {}) {
+  state.dirty = flag;
+  if (!flag && state.autosaveTimer) {
+    clearTimeout(state.autosaveTimer);
+    state.autosaveTimer = null;
+  }
+  if (flag && state.settings.autoSave !== false) {
+    scheduleWorkspaceDraftSave();
+  }
+  if (flag && !silent) {
+    showStatus("Unsaved changes.");
+  }
+}
+
+async function saveWorkspaceDraft({ silent } = {}) {
+  const payload = buildDraftWorkspacePayload();
+  try {
+    await chrome.storage.local.set({
+      workspaceDraft: payload,
+      settings: state.settings
+    });
+    if (!silent) showStatus("Draft saved.");
+    return true;
+  } catch (err) {
+    console.error("[options] Failed to save workspace draft:", err);
+    return false;
+  }
+}
+
+function scheduleWorkspaceDraftSave() {
+  if (state.settings.autoSave === false) return;
+  if (state.autosaveTimer) clearTimeout(state.autosaveTimer);
+  state.autosaveTimer = setTimeout(() => {
+    state.autosaveTimer = null;
+    saveWorkspaceDraft({ silent: true });
+  }, 800);
+}
+
+function buildKeyPressEditor({ stepGetter, requestRender }) {
+  const step = stepGetter();
+  if (!step) return document.createElement("div");
+  const root = document.createElement("div");
+  root.className = "keypress-editor";
+
+  const sequenceWrap = document.createElement("div");
+  sequenceWrap.className = "field";
+  const sequenceLabel = document.createElement("label");
+  sequenceLabel.textContent = "Key sequence";
+  sequenceWrap.appendChild(sequenceLabel);
+
+  const hint = document.createElement("div");
+  hint.className = "info-text";
+  hint.textContent = "Capture usually works for most keys. Browser or OS reserved shortcuts may not be capturable; use the manual picker below for those.";
+  sequenceWrap.appendChild(hint);
+
+  const captureRow = document.createElement("div");
+  captureRow.className = "input-row keypress-capture-row";
+  captureRow.style.gridTemplateColumns = "1fr auto";
+
+  const preview = document.createElement("input");
+  preview.type = "text";
+  preview.readOnly = true;
+  const sequence = normalizeKeySequence(step.keys);
+  preview.value = sequence.length ? sequence.map(formatKeyCombo).join(" → ") : "";
+  preview.placeholder = "No keys captured yet";
+
+  const captureBtn = document.createElement("button");
+  captureBtn.type = "button";
+  captureBtn.className = "toggle";
+  captureBtn.textContent = "Capture";
+  captureBtn.addEventListener("click", () => {
+    if (activeKeyCapture?.button === captureBtn) {
+      stopActiveKeyCapture();
+      return;
+    }
+    beginKeyCapture(captureBtn, (combo) => {
+      const current = stepGetter();
+      if (!current) return;
+      current.keys = normalizeKeySequence([...(Array.isArray(current.keys) ? current.keys : []), combo]);
+      setDirty(true, { silent: true });
+      requestRender();
+    });
+  });
+
+  captureRow.appendChild(preview);
+  captureRow.appendChild(captureBtn);
+  sequenceWrap.appendChild(captureRow);
+
+  const sequenceList = document.createElement("div");
+  sequenceList.className = "keypress-sequence-list";
+  if (!sequence.length) {
+    const empty = document.createElement("div");
+    empty.className = "info-text";
+    empty.textContent = "Add at least one key combo.";
+    sequenceList.appendChild(empty);
+  } else {
+    sequence.forEach((combo, index) => {
+      const item = document.createElement("div");
+      item.className = "keypress-sequence-item";
+      const text = document.createElement("div");
+      text.className = "keypress-sequence-label";
+      text.textContent = `${index + 1}. ${formatKeyCombo(combo)}`;
+      const actions = document.createElement("div");
+      actions.className = "keypress-sequence-actions";
+
+      const moveUp = document.createElement("button");
+      moveUp.type = "button";
+      moveUp.className = "icon";
+      moveUp.title = "Move up";
+      moveUp.textContent = "↑";
+      moveUp.disabled = index === 0;
+      moveUp.addEventListener("click", () => {
+        const current = stepGetter();
+        if (!current) return;
+        const list = normalizeKeySequence(current.keys);
+        const [entry] = list.splice(index, 1);
+        list.splice(index - 1, 0, entry);
+        current.keys = list;
+        setDirty(true, { silent: true });
+        requestRender();
+      });
+
+      const moveDown = document.createElement("button");
+      moveDown.type = "button";
+      moveDown.className = "icon";
+      moveDown.title = "Move down";
+      moveDown.textContent = "↓";
+      moveDown.disabled = index === sequence.length - 1;
+      moveDown.addEventListener("click", () => {
+        const current = stepGetter();
+        if (!current) return;
+        const list = normalizeKeySequence(current.keys);
+        const [entry] = list.splice(index, 1);
+        list.splice(index + 1, 0, entry);
+        current.keys = list;
+        setDirty(true, { silent: true });
+        requestRender();
+      });
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "icon danger";
+      remove.title = "Remove";
+      remove.textContent = "✕";
+      remove.addEventListener("click", () => {
+        const current = stepGetter();
+        if (!current) return;
+        const list = normalizeKeySequence(current.keys);
+        list.splice(index, 1);
+        current.keys = list;
+        setDirty(true, { silent: true });
+        requestRender();
+      });
+
+      actions.appendChild(moveUp);
+      actions.appendChild(moveDown);
+      actions.appendChild(remove);
+      item.appendChild(text);
+      item.appendChild(actions);
+      sequenceList.appendChild(item);
+    });
+  }
+  sequenceWrap.appendChild(sequenceList);
+
+  const manualWrap = document.createElement("div");
+  manualWrap.className = "field";
+  const manualLabel = document.createElement("label");
+  manualLabel.textContent = "Manual key picker";
+  manualWrap.appendChild(manualLabel);
+
+  const modifierRow = document.createElement("div");
+  modifierRow.className = "keypress-modifiers";
+  const modifierState = { ctrlKey: false, altKey: false, shiftKey: false, metaKey: false };
+  [
+    ["ctrlKey", "Ctrl"],
+    ["altKey", "Alt"],
+    ["shiftKey", "Shift"],
+    ["metaKey", "Meta"]
+  ].forEach(([key, label]) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "toggle";
+    btn.textContent = label;
+    btn.addEventListener("click", () => {
+      modifierState[key] = !modifierState[key];
+      btn.classList.toggle("active", modifierState[key]);
+    });
+    modifierRow.appendChild(btn);
+  });
+  manualWrap.appendChild(modifierRow);
+
+  const manualRow = document.createElement("div");
+  manualRow.className = "input-row keypress-manual-row";
+  manualRow.style.gridTemplateColumns = "1fr auto";
+
+  const keySelect = document.createElement("select");
+  KEY_PRESS_DROPDOWN_OPTIONS.forEach((option) => {
+    const el = document.createElement("option");
+    el.value = option.code;
+    el.textContent = option.label;
+    keySelect.appendChild(el);
+  });
+
+  const addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.textContent = "Add";
+  addBtn.addEventListener("click", () => {
+    const option = KEY_OPTION_MAP.get(keySelect.value);
+    if (!option) return;
+    const current = stepGetter();
+    if (!current) return;
+    current.keys = normalizeKeySequence([
+      ...(Array.isArray(current.keys) ? current.keys : []),
+      {
+        key: option.key,
+        code: option.code,
+        ...modifierState
+      }
+    ]);
+    setDirty(true, { silent: true });
+    requestRender();
+  });
+
+  manualRow.appendChild(keySelect);
+  manualRow.appendChild(addBtn);
+  manualWrap.appendChild(manualRow);
+
+  const advancedWrap = document.createElement("div");
+  advancedWrap.className = "field";
+  const details = document.createElement("details");
+  details.className = "advanced-section";
+  const summary = document.createElement("summary");
+  summary.textContent = "Advanced";
+  details.appendChild(summary);
+
+  const advancedGrid = document.createElement("div");
+  advancedGrid.className = "advanced-grid";
+
+  const makeNumberField = (labelText, key, fallback) => {
+    const wrap = document.createElement("div");
+    wrap.className = "field";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = "0";
+    input.step = "10";
+    if (key === "repeat") {
+      input.min = "1";
+      input.step = "1";
+    }
+    const currentValue = Number(step[key]);
+    input.value = String(Number.isFinite(currentValue) && currentValue >= Number(input.min) ? currentValue : fallback);
+    input.addEventListener("input", (event) => {
+      const current = stepGetter();
+      if (!current) return;
+      const numeric = Number(event.target.value);
+      if (!Number.isFinite(numeric)) return;
+      current[key] = numeric;
+      setDirty(true, { silent: true });
+    });
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    return wrap;
+  };
+
+  advancedGrid.appendChild(makeNumberField("Repeat count", "repeat", 1));
+  advancedGrid.appendChild(makeNumberField("Delay between repeats (ms)", "repeatDelayMs", 120));
+  advancedGrid.appendChild(makeNumberField("Delay between keys (ms)", "keyDelayMs", 60));
+  advancedGrid.appendChild(makeNumberField("Hold key combo (ms)", "holdMs", 0));
+  details.appendChild(advancedGrid);
+  advancedWrap.appendChild(details);
+
+  root.appendChild(sequenceWrap);
+  root.appendChild(manualWrap);
+  root.appendChild(advancedWrap);
+  return root;
 }
 
 function isInlineInsertComboActive(event) {
@@ -611,6 +1268,10 @@ chrome.runtime.onMessage.addListener((msg) => {
     handleFlowNestedStatus(msg);
     return;
   }
+  if (msg.type === "GROUP_EXEC_STATUS") {
+    handleGroupExecStatus(msg);
+    return;
+  }
   if (msg.type === "FLOW_COMPLETE") {
     handleFlowComplete(msg);
     return;
@@ -634,7 +1295,13 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "FLOW_ABORT") {
     state.isRunning = false;
     state.stopSuppressUntil = 0;
+    state.waitCountdowns = {};
+    state.waitDeadlines = {};
+    state.nestedWaitCountdowns = {};
+    state.nestedWaitDeadlines = {};
+    syncCountdownTicker();
     updateRunButton();
+    render();
     return;
   }
   if (msg.type === "FLOW_ITER") {
@@ -675,7 +1342,14 @@ function wireEvents() {
   els.addStep?.addEventListener("click", () => {
     if (addStep()) {
       render();
-      setDirty(true);
+      markWorkspaceDirty(true);
+    }
+  });
+
+  els.groupAddStep?.addEventListener("click", () => {
+    if (addStep()) {
+      render();
+      markWorkspaceDirty(true);
     }
   });
 
@@ -700,21 +1374,26 @@ function wireEvents() {
   els.discardChanges?.addEventListener("click", () => {
     restoreLastSaved();
     render();
-    setDirty(false);
+    saveWorkspaceDraft({ silent: true });
+    markWorkspaceDirty(false);
     showStatus("Changes discarded.");
   });
 
   els.loadDefault?.addEventListener("click", () => {
     if (!confirm("Replace the current steps with the default example flow?")) return;
-    state.steps = cloneFlow(DEFAULT_FLOW);
+    state.mainSteps = cloneFlow(DEFAULT_FLOW);
+    syncEditorSteps();
     state.flowName = DEFAULT_FLOW_NAME;
-    state.stepStatuses = state.steps.map(() => "idle");
+    state.stepStatuses = state.mainSteps.map(() => "idle");
     state.nestedStatuses = {};
     state.ifResults = {};
+    state.groupExecStates = {};
     state.waitCountdowns = {};
+    state.waitDeadlines = {};
     state.nestedWaitCountdowns = {};
+    state.nestedWaitDeadlines = {};
     render();
-    setDirty(true);
+    markWorkspaceDirty(true);
     showStatus("Loaded default flow. Save to persist.");
   });
 
@@ -730,7 +1409,7 @@ function wireEvents() {
       const payload = JSON.parse(text);
       applyImportedFlow(payload);
       render();
-      setDirty(true);
+      markWorkspaceDirty(true);
       showStatus("Imported flow. Save to persist.");
     } catch (err) {
       console.error("[options] Import failed:", err);
@@ -750,7 +1429,7 @@ function wireEvents() {
       return;
     }
     const prepared = validateAndPrepare(); if (!prepared) return;
-    await persistFlow({ steps: prepared.steps, flowName: prepared.flowName, silent: true });
+    await persistFlow({ steps: prepared.steps, flowName: prepared.flowName, groups: prepared.groups, silent: true });
     // Reset runs counter when starting a new run (both total and UI snapshot)
     state.runCount = 0;
     try {
@@ -779,13 +1458,17 @@ function wireEvents() {
   els.menuClear?.addEventListener("click", () => {
     els.moreMenu?.classList.add("hidden");
     if (!confirm("Clear all steps and start with an empty flow?")) return;
-    state.steps = [];
+    state.mainSteps = [];
+    syncEditorSteps();
     state.stepStatuses = [];
     state.nestedStatuses = {};
     state.ifResults = {};
+    state.groupExecStates = {};
     state.waitCountdowns = {};
+    state.waitDeadlines = {};
     state.nestedWaitCountdowns = {};
-    setDirty(true);
+    state.nestedWaitDeadlines = {};
+    markWorkspaceDirty(true);
     render();
     showStatus("Flow cleared. Add steps to start building.");
   });
@@ -794,11 +1477,21 @@ function wireEvents() {
 
   els.flowName?.addEventListener("input", (event) => {
     state.flowName = event.target.value;
-    setDirty(true, { silent: true });
+    markWorkspaceDirty(true, { silent: true });
+  });
+
+  els.groupNameInput?.addEventListener("input", (event) => {
+    const group = getSelectedGroup();
+    if (!group) return;
+    group.name = event.target.value;
+    markWorkspaceDirty(true, { silent: true });
+    renderGroupsList();
+    renderTransferModal();
   });
 
   // tabs
   els.tabFlowBtn?.addEventListener("click", () => selectTab("flow"));
+  els.tabGroupsBtn?.addEventListener("click", () => selectTab("groups"));
   els.tabSettingsBtn?.addEventListener("click", () => selectTab("settings"));
   els.tabLibraryBtn?.addEventListener("click", () => selectTab("library"));
 
@@ -807,31 +1500,42 @@ function wireEvents() {
     const v = Number(e.target.value);
     if (Number.isFinite(v) && v >= 0) {
       state.settings.stepDelayMs = v;
-      setDirty(true, { silent: true });
+      markWorkspaceDirty(true, { silent: true });
     }
   });
   els.selectorWaitMs?.addEventListener("input", (e) => {
     const v = Number(e.target.value);
     if (Number.isFinite(v) && v >= 0) {
       state.settings.selectorWaitMs = v;
-      setDirty(true, { silent: true });
+      markWorkspaceDirty(true, { silent: true });
     }
   });
 
   els.useNativeClick?.addEventListener("change", (e) => {
     state.settings.useNativeClick = Boolean(e.target.checked);
-    setDirty(true, { silent: true });
+    markWorkspaceDirty(true, { silent: true });
   });
 
   els.readInsideIframes?.addEventListener("change", (e) => {
     state.settings.readInsideIframes = Boolean(e.target.checked);
-    setDirty(true, { silent: true });
+    markWorkspaceDirty(true, { silent: true });
+  });
+
+  els.autoSave?.addEventListener("change", async (e) => {
+    state.settings.autoSave = Boolean(e.target.checked);
+    markWorkspaceDirty(true, { silent: true });
+    if (state.settings.autoSave) {
+      await saveWorkspaceDraft({ silent: true });
+    } else if (state.autosaveTimer) {
+      clearTimeout(state.autosaveTimer);
+      state.autosaveTimer = null;
+    }
   });
 
   els.gmailClientId?.addEventListener("input", (e) => {
     const v = e.target.value.trim();
     state.settings.gmailClientId = v;
-    setDirty(true, { silent: true });
+    markWorkspaceDirty(true, { silent: true });
   });
 
   // library events
@@ -873,57 +1577,160 @@ function wireEvents() {
 
   // removed: mailslurp API key
 
+  els.createGroupBtn?.addEventListener("click", () => {
+    const group = createGroup();
+    state.groups.unshift(group);
+    state.selectedGroupId = group.id;
+    selectTab("groups");
+    markWorkspaceDirty(true);
+    render();
+    showStatus("Group created.");
+  });
+
+  els.closeGroupEditorBtn?.addEventListener("click", () => {
+    state.selectedGroupId = null;
+    selectTab("groups");
+    render();
+  });
+
+  els.openTransferModalBtn?.addEventListener("click", () => {
+    if (!getSelectedGroup()) return;
+    state.transferModal = {
+      open: true,
+      mode: "copy",
+      source: "main",
+      selectedIndices: []
+    };
+    renderTransferModal();
+  });
+
+  els.closeTransferModalBtn?.addEventListener("click", closeTransferModal);
+  els.transferModeCopyBtn?.addEventListener("click", () => {
+    state.transferModal.mode = "copy";
+    renderTransferModal();
+  });
+  els.transferModeCutBtn?.addEventListener("click", () => {
+    state.transferModal.mode = "cut";
+    renderTransferModal();
+  });
+  els.transferSourceSelect?.addEventListener("change", (event) => {
+    state.transferModal.source = event.target.value;
+    state.transferModal.selectedIndices = [];
+    renderTransferModal();
+  });
+  els.transferSelectAllBtn?.addEventListener("click", () => {
+    state.transferModal.selectedIndices = getTransferSourceSteps().map((_, index) => index);
+    renderTransferModal();
+  });
+  els.transferClearSelectionBtn?.addEventListener("click", () => {
+    state.transferModal.selectedIndices = [];
+    renderTransferModal();
+  });
+  els.executeTransferBtn?.addEventListener("click", executeTransferSelection);
+
 }
 
 async function loadFromStorage() {
   try {
-    const { activeFlow, flowName, settings, flowUiState, savedFlows, runCountTotal } = await chrome.storage.local.get(["activeFlow", "flowName", "settings", "flowUiState", "savedFlows", "runCountTotal"]);
-    const sanitized = sanitizeFlowArray(activeFlow);
-    state.steps = sanitized.length ? sanitized : cloneFlow(DEFAULT_FLOW);
-    state.flowName = typeof flowName === "string" && flowName.trim() ? flowName : DEFAULT_FLOW_NAME;
-    state.settings = { ...DEFAULT_SETTINGS, ...(settings || {}) };
+    const stored = await chrome.storage.local.get([
+      "activeFlow",
+      "flowName",
+      "groups",
+      "workspaceDraft",
+      "settings",
+      "flowUiState",
+      "savedFlows",
+      "runCountTotal"
+    ]);
+    const publishedSteps = sanitizeFlowArray(stored.activeFlow);
+    const publishedGroups = sanitizeGroups(stored.groups);
+    const publishedFlowName = typeof stored.flowName === "string" && stored.flowName.trim() ? stored.flowName : DEFAULT_FLOW_NAME;
+    const draft = stored.workspaceDraft && typeof stored.workspaceDraft === "object" ? stored.workspaceDraft : null;
+    const draftSteps = sanitizeFlowArray(draft?.steps);
+    const draftGroups = sanitizeGroups(draft?.groups);
+    state.mainSteps = draft
+      ? (draftSteps.length ? draftSteps : cloneFlow(DEFAULT_FLOW))
+      : (publishedSteps.length ? publishedSteps : cloneFlow(DEFAULT_FLOW));
+    state.groups = draft ? draftGroups : publishedGroups;
+    state.flowName = draft?.flowName && String(draft.flowName).trim() ? String(draft.flowName).trim() : publishedFlowName;
+    state.settings = { ...DEFAULT_SETTINGS, ...(stored.settings || {}) };
+    state.activeTab = draft?.selectedTab === "groups" || draft?.selectedTab === "settings" || draft?.selectedTab === "library"
+      ? draft.selectedTab
+      : "flow";
+    state.selectedGroupId = typeof draft?.selectedGroupId === "string" ? draft.selectedGroupId : null;
+    if (state.selectedGroupId && !state.groups.some((group) => group.id === state.selectedGroupId)) {
+      state.selectedGroupId = null;
+    }
+    syncEditorSteps();
     // restore statuses if available
-    const ui = flowUiState || {};
+    const ui = stored.flowUiState || {};
     const baseStatuses = Array.isArray(ui.stepStatuses) ? ui.stepStatuses.slice() : [];
     // ensure length matches steps
-    state.stepStatuses = state.steps.map((_, i) => baseStatuses[i] || "idle");
+    state.stepStatuses = state.mainSteps.map((_, i) => baseStatuses[i] || "idle");
     state.nestedStatuses = typeof ui.nestedStatuses === 'object' && ui.nestedStatuses ? ui.nestedStatuses : {};
     state.ifResults = typeof ui.ifResults === 'object' && ui.ifResults ? ui.ifResults : {};
     state.waitCountdowns = typeof ui.waitCountdowns === 'object' && ui.waitCountdowns ? ui.waitCountdowns : {};
+    state.waitDeadlines = typeof ui.waitDeadlines === 'object' && ui.waitDeadlines ? ui.waitDeadlines : {};
     state.nestedWaitCountdowns = typeof ui.nestedWaitCountdowns === 'object' && ui.nestedWaitCountdowns ? ui.nestedWaitCountdowns : {};
-    const hasTotal = runCountTotal !== undefined && runCountTotal !== null;
-    state.runCount = hasTotal ? (Number(runCountTotal) || 0) : (Number(ui.iterCount) || 0);
-    state.savedFlows = Array.isArray(savedFlows) ? savedFlows : [];
-    snapshotAsSaved();
-    setDirty(false, { silent: true });
-    // restore running state (treat stale UI state as not running)
+    state.nestedWaitDeadlines = typeof ui.nestedWaitDeadlines === 'object' && ui.nestedWaitDeadlines ? ui.nestedWaitDeadlines : {};
+    const hasTotal = stored.runCountTotal !== undefined && stored.runCountTotal !== null;
+    state.runCount = hasTotal ? (Number(stored.runCountTotal) || 0) : (Number(ui.iterCount) || 0);
+    state.savedFlows = sanitizeSavedFlows(stored.savedFlows);
+    const hasPublishedWorkspace = publishedSteps.length > 0 || publishedGroups.length > 0;
+    state.lastSaved = {
+      steps: hasPublishedWorkspace ? publishedSteps : cloneFlow(state.mainSteps),
+      flowName: hasPublishedWorkspace ? publishedFlowName : state.flowName,
+      groups: hasPublishedWorkspace ? publishedGroups : deepClone(state.groups)
+    };
+    markWorkspaceDirty(false, { silent: true });
+    refreshCountdownState();
+    // restore running state (treat stale UI state as not running unless live waits prove otherwise)
     try {
-      const uiRunning = flowUiState?.isRunning === true;
-      const last = Number(flowUiState?.lastUpdatedAt) || 0;
+      const uiRunning = stored.flowUiState?.isRunning === true;
+      const last = Number(stored.flowUiState?.lastUpdatedAt) || 0;
       const stale = !last || (Date.now() - last > 5000);
-      const anyActive = state.stepStatuses.some(s => s === 'pending' || s === 'running');
+      const anyActive = state.stepStatuses.some(s => s === 'pending' || s === 'running')
+        || Object.values(state.waitDeadlines || {}).some((until) => {
+          const remaining = computeRemainingSeconds(until);
+          return Number.isFinite(remaining) && remaining > 0;
+        })
+        || Object.values(state.nestedWaitDeadlines || {}).some((until) => {
+          const remaining = computeRemainingSeconds(until);
+          return Number.isFinite(remaining) && remaining > 0;
+        });
       state.isRunning = (uiRunning && !stale) || anyActive;
       updateRunButton();
     } catch {}
+    syncCountdownTicker();
   } catch (err) {
     console.warn("[options] Failed to load stored flow, using defaults:", err);
-    state.steps = cloneFlow(DEFAULT_FLOW);
+    state.mainSteps = cloneFlow(DEFAULT_FLOW);
+    state.groups = [];
     state.flowName = DEFAULT_FLOW_NAME;
+    state.activeTab = "flow";
+    state.selectedGroupId = null;
     state.settings = { ...DEFAULT_SETTINGS };
-    state.stepStatuses = state.steps.map(() => "idle");
+    syncEditorSteps();
+    state.stepStatuses = state.mainSteps.map(() => "idle");
     state.nestedStatuses = {};
     state.ifResults = {};
+    state.groupExecStates = {};
     state.waitCountdowns = {};
+    state.waitDeadlines = {};
     state.nestedWaitCountdowns = {};
+    state.nestedWaitDeadlines = {};
     state.runCount = 0;
     state.savedFlows = [];
     snapshotAsSaved();
-    setDirty(false, { silent: true });
+    markWorkspaceDirty(false, { silent: true });
+    syncCountdownTicker();
   }
 }
 
 function render() {
+  syncEditorSteps();
   renderSteps();
+  renderGroupsView();
   els.flowName.value = state.flowName;
   if (els.runCounter) els.runCounter.textContent = `Runs: ${state.runCount || 0}`;
   if (els.runCounter) els.runCounter.style.display = (state.runCount && state.runCount > 0) ? '' : 'none';
@@ -932,6 +1739,7 @@ function render() {
   if (els.selectorWaitMs) els.selectorWaitMs.value = String(state.settings.selectorWaitMs ?? DEFAULT_SETTINGS.selectorWaitMs);
   if (els.useNativeClick) els.useNativeClick.checked = Boolean(state.settings.useNativeClick ?? DEFAULT_SETTINGS.useNativeClick);
   if (els.readInsideIframes) els.readInsideIframes.checked = Boolean(state.settings.readInsideIframes ?? DEFAULT_SETTINGS.readInsideIframes);
+  if (els.autoSave) els.autoSave.checked = Boolean(state.settings.autoSave ?? DEFAULT_SETTINGS.autoSave);
   if (els.gmailClientId) els.gmailClientId.value = String(state.settings.gmailClientId ?? "");
   if (els.versionLabel) {
     const version = getExtensionVersion();
@@ -941,6 +1749,7 @@ function render() {
   updateEmptyState();
   setControlsDisabled(Boolean(state.pendingPicker));
   updateControlsForTab();
+  renderTransferModal();
   if (state.pendingPicker) {
     showStatus(PICKER_STATUS_TEXT, { persistent: true });
   } else if (state.dirty) {
@@ -952,6 +1761,10 @@ function render() {
 
 function renderSteps() {
   const container = els.stepsContainer;
+  renderStepsInto(container);
+}
+
+function renderStepsInto(container) {
   if (!container) return;
   container.innerHTML = "";
   markListDroppable(container, [], 'root');
@@ -971,6 +1784,413 @@ function renderSteps() {
   if (state.steps.length === 0 && !showInlineSlots) {
     // nothing extra; empty state handles messaging
   }
+}
+
+function renderGroupsView() {
+  const isGroupOpen = isEditingGroup();
+  if (els.groupsListView) els.groupsListView.classList.toggle("hidden", isGroupOpen);
+  if (els.groupEditorView) els.groupEditorView.classList.toggle("hidden", !isGroupOpen);
+  renderGroupsList();
+  renderGroupEditor();
+}
+
+function renderGroupsList() {
+  const container = els.groupsContainer;
+  if (!container) return;
+  container.innerHTML = "";
+  if (!state.groups.length) {
+    els.groupsEmptyState?.classList.remove("hidden");
+    return;
+  }
+  els.groupsEmptyState?.classList.add("hidden");
+  state.groups.forEach((group, index) => {
+    const card = document.createElement("article");
+    card.className = "step-card group-list-item";
+    const header = document.createElement("div");
+    header.className = "step-header";
+    const title = document.createElement("span");
+    title.className = "step-title";
+    title.textContent = group.name;
+    const actions = document.createElement("div");
+    actions.className = "step-actions";
+    const openBtn = document.createElement("button");
+    openBtn.type = "button";
+    openBtn.className = "icon";
+    openBtn.title = "Open group";
+    openBtn.textContent = "↗";
+    openBtn.addEventListener("click", () => {
+      state.selectedGroupId = group.id;
+      selectTab("groups");
+      render();
+    });
+    const deleteBtn = document.createElement("button");
+    deleteBtn.type = "button";
+    deleteBtn.className = "icon danger";
+    deleteBtn.title = "Delete group";
+    deleteBtn.textContent = "✕";
+    deleteBtn.addEventListener("click", () => {
+      if (!confirm(`Delete group “${group.name}”?`)) return;
+      state.groups = state.groups.filter((item) => item.id !== group.id);
+      if (state.selectedGroupId === group.id) state.selectedGroupId = null;
+      syncEditorSteps();
+      markWorkspaceDirty(true);
+      render();
+      showStatus("Group deleted.");
+    });
+    actions.appendChild(openBtn);
+    actions.appendChild(deleteBtn);
+    header.appendChild(title);
+    header.appendChild(actions);
+    const meta = document.createElement("div");
+    meta.className = "group-meta";
+    meta.textContent = `${group.steps.length} step${group.steps.length === 1 ? "" : "s"} · Group ${index + 1}`;
+    card.appendChild(header);
+    card.appendChild(meta);
+    container.appendChild(card);
+  });
+}
+
+function renderGroupEditor() {
+  const group = getSelectedGroup();
+  if (!group) {
+    if (els.groupStepsContainer) els.groupStepsContainer.innerHTML = "";
+    if (els.groupEmptyState) els.groupEmptyState.classList.add("hidden");
+    if (els.groupNameInput) els.groupNameInput.value = "";
+    if (els.groupMeta) els.groupMeta.textContent = "";
+    return;
+  }
+  if (els.groupNameInput && document.activeElement !== els.groupNameInput) {
+    els.groupNameInput.value = group.name;
+  }
+  if (els.groupMeta) {
+    els.groupMeta.textContent = `${group.steps.length} step${group.steps.length === 1 ? "" : "s"} in this group`;
+  }
+  renderStepsInto(els.groupStepsContainer);
+  if (els.groupEmptyState) {
+    els.groupEmptyState.classList.toggle("hidden", group.steps.length > 0);
+  }
+  performPendingGroupStepJump();
+}
+
+function closeTransferModal() {
+  const active = document.activeElement;
+  if (els.transferModal && active instanceof HTMLElement && els.transferModal.contains(active)) {
+    const fallback = els.openTransferModalBtn || els.groupNameInput || els.closeGroupEditorBtn || els.tabGroupsBtn;
+    if (fallback instanceof HTMLElement) {
+      fallback.focus({ preventScroll: true });
+    } else {
+      active.blur();
+    }
+  }
+  state.transferModal.open = false;
+  renderTransferModal();
+}
+
+function getTransferSourceOptions() {
+  const destinationGroupId = state.selectedGroupId;
+  const options = [{ value: "main", label: "Main Flow" }];
+  state.groups.forEach((group) => {
+    if (group.id === destinationGroupId) return;
+    options.push({ value: group.id, label: group.name });
+  });
+  return options;
+}
+
+function getTransferSourceSteps() {
+  const source = state.transferModal.source;
+  if (source === "main") return state.mainSteps;
+  const group = state.groups.find((item) => item.id === source);
+  return Array.isArray(group?.steps) ? group.steps : [];
+}
+
+function renderTransferModal() {
+  if (!els.transferModal) return;
+  const open = Boolean(state.transferModal.open) && Boolean(getSelectedGroup());
+  els.transferModal.classList.toggle("hidden", !open);
+  els.transferModal.setAttribute("aria-hidden", String(!open));
+  if (!open) {
+    els.transferModal.setAttribute("inert", "");
+  } else {
+    els.transferModal.removeAttribute("inert");
+  }
+  if (!open) return;
+
+  const options = getTransferSourceOptions();
+  if (!options.some((option) => option.value === state.transferModal.source)) {
+    state.transferModal.source = options[0]?.value || "main";
+    state.transferModal.selectedIndices = [];
+  }
+  if (els.transferSourceSelect) {
+    els.transferSourceSelect.innerHTML = "";
+    options.forEach((option) => {
+      const el = document.createElement("option");
+      el.value = option.value;
+      el.textContent = option.label;
+      els.transferSourceSelect.appendChild(el);
+    });
+    els.transferSourceSelect.value = state.transferModal.source;
+  }
+  els.transferModeCopyBtn?.classList.toggle("active", state.transferModal.mode === "copy");
+  els.transferModeCutBtn?.classList.toggle("active", state.transferModal.mode === "cut");
+
+  const list = els.transferSourceList;
+  if (!list) return;
+  const steps = getTransferSourceSteps();
+  const selected = new Set(state.transferModal.selectedIndices);
+  list.innerHTML = "";
+  if (!steps.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "This source has no top-level steps to transfer.";
+    list.appendChild(empty);
+  } else {
+    steps.forEach((step, index) => {
+      const row = document.createElement("label");
+      row.className = "transfer-item";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = selected.has(index);
+      checkbox.addEventListener("change", (event) => {
+        const next = new Set(state.transferModal.selectedIndices);
+        if (event.target.checked) next.add(index);
+        else next.delete(index);
+        state.transferModal.selectedIndices = Array.from(next).sort((left, right) => left - right);
+        renderTransferModal();
+      });
+      const info = document.createElement("div");
+      const title = document.createElement("div");
+      title.textContent = summarizeStep(step, index);
+      const meta = document.createElement("div");
+      meta.className = "transfer-item-copy";
+      meta.textContent = step?.type === "If"
+        ? `${Array.isArray(step.then) ? step.then.length : 0} then / ${Array.isArray(step.else) ? step.else.length : 0} else nested steps`
+        : "Top-level step";
+      info.appendChild(title);
+      info.appendChild(meta);
+      row.appendChild(checkbox);
+      row.appendChild(info);
+      list.appendChild(row);
+    });
+  }
+  if (els.transferSelectionSummary) {
+    const count = state.transferModal.selectedIndices.length;
+    els.transferSelectionSummary.textContent = count
+      ? `${count} step${count === 1 ? "" : "s"} selected for ${state.transferModal.mode}.`
+      : "Select top-level steps to transfer.";
+  }
+}
+
+async function executeTransferSelection() {
+  const destinationGroup = getSelectedGroup();
+  if (!destinationGroup) return;
+  const sourceId = state.transferModal.source;
+  const sourceSteps = getTransferSourceSteps();
+  const selected = Array.from(new Set(state.transferModal.selectedIndices)).sort((left, right) => left - right);
+  if (!selected.length) {
+    alert("Select at least one step to transfer.");
+    return;
+  }
+  const clones = selected.map((index) => deepClone(sourceSteps[index])).filter(Boolean);
+  destinationGroup.steps.push(...clones);
+  if (state.transferModal.mode === "cut") {
+    const remaining = sourceSteps.filter((_, index) => !selected.includes(index));
+    if (sourceId === "main") {
+      state.mainSteps = remaining;
+      state.stepStatuses = state.mainSteps.map(() => "idle");
+      state.nestedStatuses = {};
+      state.ifResults = {};
+      state.groupExecStates = {};
+      state.waitCountdowns = {};
+      state.waitDeadlines = {};
+      state.nestedWaitCountdowns = {};
+      state.nestedWaitDeadlines = {};
+    } else {
+      const sourceGroup = state.groups.find((group) => group.id === sourceId);
+      if (sourceGroup) sourceGroup.steps = remaining;
+    }
+  }
+  syncEditorSteps();
+  markWorkspaceDirty(true);
+  closeTransferModal();
+  render();
+  showStatus(`Transferred ${clones.length} step${clones.length === 1 ? "" : "s"} to group.`);
+}
+
+function getDisplayedStepStatus(index) {
+  if (isEditingGroup()) return "idle";
+  const step = state.mainSteps[index];
+  if (step?.type === "Wait") {
+    const remaining = computeRemainingSeconds(state.waitDeadlines?.[index]);
+    if (Number.isFinite(remaining) && remaining > 0) {
+      return "running";
+    }
+  }
+  return state.stepStatuses[index] || "idle";
+}
+
+function getDisplayedNestedStatus(key, stepType) {
+  if (isEditingGroup()) return "idle";
+  if (stepType === "Wait") {
+    const remaining = computeRemainingSeconds(state.nestedWaitDeadlines?.[key]);
+    if (Number.isFinite(remaining) && remaining > 0) {
+      return "running";
+    }
+  }
+  return state.nestedStatuses[key] || "idle";
+}
+
+function getGroupExecState(index) {
+  return state.groupExecStates[index] || null;
+}
+
+function queueGroupStepJump(groupId, stepIndex) {
+  state.groupStepJumpTarget = {
+    groupId,
+    stepIndex: Number(stepIndex)
+  };
+}
+
+function performPendingGroupStepJump() {
+  const jump = state.groupStepJumpTarget;
+  if (!jump || !els.groupStepsContainer || state.selectedGroupId !== jump.groupId) return;
+  const card = els.groupStepsContainer.querySelector(`.step-card[data-step-index="${jump.stepIndex}"]`);
+  if (!card) return;
+  state.groupStepJumpTarget = null;
+  requestAnimationFrame(() => {
+    card.scrollIntoView({ behavior: "smooth", block: "center" });
+    card.classList.add("drop-target-highlight");
+    setTimeout(() => card.classList.remove("drop-target-highlight"), 1800);
+  });
+}
+
+function computeRemainingSeconds(until) {
+  const deadline = Number(until);
+  if (!Number.isFinite(deadline)) return null;
+  return Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+}
+
+function refreshCountdownState() {
+  let changed = false;
+
+  Object.keys(state.waitDeadlines || {}).forEach((key) => {
+    const next = computeRemainingSeconds(state.waitDeadlines[key]);
+    if (next == null) return;
+    if (state.waitCountdowns[key] !== next) {
+      state.waitCountdowns[key] = next;
+      changed = true;
+    }
+  });
+
+  Object.keys(state.nestedWaitDeadlines || {}).forEach((key) => {
+    const next = computeRemainingSeconds(state.nestedWaitDeadlines[key]);
+    if (next == null) return;
+    if (state.nestedWaitCountdowns[key] !== next) {
+      state.nestedWaitCountdowns[key] = next;
+      changed = true;
+    }
+  });
+
+  Object.entries(state.waitDeadlines || {}).forEach(([key, until]) => {
+    const remaining = computeRemainingSeconds(until);
+    if (remaining != null && remaining > 0 && state.stepStatuses[key] !== 'running') {
+      state.stepStatuses[key] = 'running';
+      changed = true;
+    }
+  });
+
+  Object.entries(state.nestedWaitDeadlines || {}).forEach(([key, until]) => {
+    const remaining = computeRemainingSeconds(until);
+    if (remaining != null && remaining > 0 && state.nestedStatuses[key] !== 'running') {
+      state.nestedStatuses[key] = 'running';
+      changed = true;
+    }
+  });
+
+  if (changed) render();
+}
+
+function syncCountdownTicker() {
+  const hasActiveWaits = Object.keys(state.waitDeadlines || {}).length > 0 || Object.keys(state.nestedWaitDeadlines || {}).length > 0;
+  if (!hasActiveWaits) {
+    if (state.countdownTicker) {
+      clearInterval(state.countdownTicker);
+      state.countdownTicker = null;
+    }
+    return;
+  }
+  if (!state.countdownTicker) {
+    state.countdownTicker = setInterval(refreshCountdownState, 250);
+  }
+}
+
+function getDisplayedWaitSeconds(index) {
+  const live = computeRemainingSeconds(state.waitDeadlines?.[index]);
+  if (live != null) return live;
+  const stored = Number(state.waitCountdowns?.[index]);
+  return Number.isFinite(stored) ? Math.max(0, stored) : null;
+}
+
+function getDisplayedNestedWaitSeconds(key) {
+  const live = computeRemainingSeconds(state.nestedWaitDeadlines?.[key]);
+  if (live != null) return live;
+  const stored = Number(state.nestedWaitCountdowns?.[key]);
+  return Number.isFinite(stored) ? Math.max(0, stored) : null;
+}
+
+function buildGroupExecLabel(index, fallbackLabel) {
+  const runtime = getGroupExecState(index);
+  if (!runtime) return fallbackLabel;
+  const total = Number(runtime.total) || 0;
+  const current = Math.max(0, Math.min(Number(runtime.current) || 0, total || 0));
+  const prefix = runtime.status === "error"
+    ? "Error"
+    : (runtime.status === "success" ? "Complete" : (runtime.status === "pending" ? "Pending" : "Running"));
+  return total > 0 ? `${prefix} ${current}/${total}` : prefix;
+}
+
+function createGroupExecRuntime(index) {
+  const runtime = getGroupExecState(index);
+  if (!runtime) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "group-runtime";
+
+  const title = document.createElement("div");
+  title.className = "group-runtime-title";
+  title.textContent = runtime.groupName ? `Group: ${runtime.groupName}` : "Group runtime";
+  wrap.appendChild(title);
+
+  const list = document.createElement("div");
+  list.className = "group-runtime-list";
+  (Array.isArray(runtime.items) ? runtime.items : []).forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "group-runtime-item";
+    const status = RUN_STATUS_META[item?.status] || RUN_STATUS_META.idle;
+    const dot = document.createElement("span");
+    dot.className = `group-runtime-dot ${status.className}`;
+    dot.textContent = status.icon;
+    const label = document.createElement("span");
+    label.className = "group-runtime-item-label";
+    label.textContent = item?.label || "Step";
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "icon group-runtime-jump";
+    action.title = "Go to node";
+    action.textContent = "↗";
+    action.addEventListener("click", () => {
+      if (!runtime.groupId || !Number.isFinite(Number(item?.index))) return;
+      state.selectedGroupId = runtime.groupId;
+      queueGroupStepJump(runtime.groupId, Number(item.index));
+      state.activeTab = "groups";
+      selectTab("groups");
+      render();
+    });
+    row.appendChild(dot);
+    row.appendChild(label);
+    row.appendChild(action);
+    list.appendChild(row);
+  });
+  wrap.appendChild(list);
+  return wrap;
 }
 
 function createInlineAddSlot(position) {
@@ -995,6 +2215,7 @@ function createStepCard(step, index) {
   const schema = STEP_LIBRARY_MAP.get(step.type) || STEP_LIBRARY[0];
   const fragment = template.content.cloneNode(true);
   const card = fragment.querySelector(".step-card");
+  card.dataset.stepIndex = String(index);
   const title = card.querySelector(".step-title");
   const typeSelect = card.querySelector(".step-type");
   const fieldsContainer = card.querySelector(".step-fields");
@@ -1006,16 +2227,19 @@ function createStepCard(step, index) {
   title.textContent = `Step ${index + 1} — ${schema?.label || step.type}`;
 
   // set status
-  const st = RUN_STATUS_META[state.stepStatuses[index] || "idle"] || RUN_STATUS_META.idle;
+  const st = RUN_STATUS_META[getDisplayedStepStatus(index)] || RUN_STATUS_META.idle;
   chipIcon.textContent = st.icon;
   let label = st.label;
   if (schema.type === 'If') {
     const res = state.ifResults[index];
     if (res) label = `${label} (${res === 'then' ? 'Then' : 'Else'})`;
   }
-  if (schema.type === 'Wait' && (state.stepStatuses[index] === 'running')) {
-    const sec = state.waitCountdowns?.[index];
-    if (Number.isFinite(sec) && sec > 0) label = `Running — ${sec}s`;
+  if (schema.type === "GroupExecuter") {
+    label = buildGroupExecLabel(index, label);
+  }
+  if (schema.type === 'Wait' && (getDisplayedStepStatus(index) === 'running')) {
+    const sec = getDisplayedWaitSeconds(index);
+    if (Number.isFinite(sec)) label = `Running — ${sec}s`;
   }
   chipLabel.textContent = label;
   chip.className = `status-chip ${st.className}`;
@@ -1039,9 +2263,9 @@ function createStepCard(step, index) {
 
   const actions = card.querySelectorAll(".step-actions [data-action]");
   actions.forEach((btn) => {
-    btn.disabled = Boolean(state.pendingPicker);
+    const action = btn.dataset.action;
+    btn.disabled = Boolean(state.pendingPicker) || (isEditingGroup() && action === "run");
     btn.addEventListener("click", () => {
-      const action = btn.dataset.action;
       if (action === "delete") {
         deleteStep(index);
       } else if (action === "up") {
@@ -1058,6 +2282,13 @@ function createStepCard(step, index) {
 
   if (schema.type === "If") {
     renderIfBranches(fieldsContainer, step, index);
+  }
+
+  if (schema.type === "GroupExecuter") {
+    const runtime = createGroupExecRuntime(index);
+    if (runtime) {
+      card.appendChild(runtime);
+    }
   }
 
   setupStepCardDnD(card, [index]);
@@ -1117,7 +2348,13 @@ async function runSingleStep(index) {
     if (prepared.type === "Click") {
       prepared.forceClick = Boolean(state.steps[index]?.forceClick);
     }
-    const res = await chrome.runtime.sendMessage({ type: "RUN_SINGLE_STEP", tabId: tab.id, step: prepared, index });
+    const res = await chrome.runtime.sendMessage({
+      type: "RUN_SINGLE_STEP",
+      tabId: tab.id,
+      step: prepared,
+      index,
+      groups: deepClone(state.groups)
+    });
     if (!res?.ok) {
       state.stepStatuses[index] = "error";
       render();
@@ -1172,6 +2409,9 @@ function buildFields(container, schema, step, stepIndex, ctx = {}) {
   };
 
   schema.fields.forEach((field) => {
+    if (schema.type === "GroupExecuter" && field.key === "groupId" && !state.groups.length) {
+      step.groupId = "";
+    }
     // Dynamic options for Restart.ifIndex and mode-dependent visibility
     if (schema.type === 'Restart' && field.key === 'ifIndex') {
       const path = Array.isArray(ctx?.path) ? ctx.path.slice() : [stepIndex];
@@ -1351,6 +2591,17 @@ function buildFields(container, schema, step, stepIndex, ctx = {}) {
       renderList();
       return; // handled custom field; continue next
     }
+    if (schema.type === "KeyPress") {
+      if (field.key === "keys") {
+        const editor = buildKeyPressEditor({
+          stepGetter: () => state.steps[stepIndex] || null,
+          requestRender: () => render()
+        });
+        container.appendChild(editor);
+        return;
+      }
+      if (["repeat", "repeatDelayMs", "keyDelayMs", "holdMs"].includes(field.key)) return;
+    }
     // Hide the dedicated checkbox field for FillText split since we expose an inline toggle next to selector
       // Removed old Split toggle next to selector for FillText; Input section renders this now
       if (schema.type === "FillText" && field.key === "splitAcrossInputs") return;
@@ -1448,12 +2699,18 @@ function buildFields(container, schema, step, stepIndex, ctx = {}) {
       input = document.createElement("textarea");
     } else if (field.type === "select") {
       input = document.createElement("select");
-      (field.options || []).forEach((opt) => {
+      const selectOptions = schema.type === "GroupExecuter" && field.key === "groupId"
+        ? buildGroupOptions({ includePlaceholder: true })
+        : (field.options || []);
+      selectOptions.forEach((opt) => {
         const option = document.createElement("option");
         option.value = String(opt.value);
         option.textContent = String(opt.label ?? opt.value);
         input.appendChild(option);
       });
+      if (schema.type === "GroupExecuter" && field.key === "groupId" && !state.groups.length) {
+        input.disabled = true;
+      }
     } else if (field.type === "checkbox") {
       input = document.createElement("input");
       input.type = "checkbox";
@@ -1485,6 +2742,9 @@ function buildFields(container, schema, step, stepIndex, ctx = {}) {
         input.value = String(existing);
       } else if (field.default !== undefined) {
         input.value = String(field.default);
+      } else if (schema.type === "GroupExecuter" && field.key === "groupId" && state.groups[0]) {
+        input.value = state.groups[0].id;
+        step.groupId = state.groups[0].id;
       }
     } else {
       if (existing !== undefined && existing !== null) {
@@ -1545,6 +2805,7 @@ function buildFields(container, schema, step, stepIndex, ctx = {}) {
         requestSelectorPick({ stepIndex, field });
       });
       row.appendChild(input);
+      row.appendChild(createSelectorPingButton(input));
       row.appendChild(btn);
 
       // Add Force toggle next to selector for Click steps
@@ -1709,13 +2970,13 @@ function createNestedStepCard(parentIndex, branchKey, childIndex, step, branchLa
   const chipIcon = card.querySelector(".chip-icon");
   const chipLabel = card.querySelector(".chip-label");
   const key = [parentIndex, branchKey, childIndex].map(String).join('|');
-  const stName = state.nestedStatuses[key] || 'idle';
+  const stName = getDisplayedNestedStatus(key, schema.type);
   const meta = RUN_STATUS_META[stName] || RUN_STATUS_META.idle;
   chipIcon.textContent = meta.icon;
   let label = meta.label;
   if (schema.type === 'Wait' && stName === 'running') {
-    const sec = state.nestedWaitCountdowns?.[key];
-    if (Number.isFinite(sec) && sec > 0) label = `Running — ${sec}s`;
+    const sec = getDisplayedNestedWaitSeconds(key);
+    if (Number.isFinite(sec)) label = `Running — ${sec}s`;
   }
   chipLabel.textContent = label;
   chip.className = `status-chip ${meta.className}`;
@@ -1946,6 +3207,17 @@ function buildFieldsNested(container, schema, step, ctx) {
       wrapper.appendChild(row); wrapper.appendChild(list); wrapper.appendChild(note);
       container.appendChild(wrapper); renderList(); return;
     }
+    if (schema.type === "KeyPress") {
+      if (field.key === "keys") {
+        const editor = buildKeyPressEditor({
+          stepGetter: stepRef,
+          requestRender: () => render()
+        });
+        container.appendChild(editor);
+        return;
+      }
+      if (["repeat", "repeatDelayMs", "keyDelayMs", "holdMs"].includes(field.key)) return;
+    }
 
     // Hide FillText's built-in toggles (custom UI renders these)
     if (schema.type === "FillText" && (field.key === "splitAcrossInputs" || field.key === "slowType" || field.key === "slowTypeDelayMs")) {
@@ -1976,7 +3248,21 @@ function buildFieldsNested(container, schema, step, ctx) {
     const label = document.createElement("label"); label.textContent = field.label;
     let input;
     if (field.type === "textarea") input = document.createElement("textarea");
-    else if (field.type === "select") { input = document.createElement("select"); (field.options || []).forEach((opt) => { const option = document.createElement("option"); option.value = String(opt.value); option.textContent = String(opt.label ?? opt.value); input.appendChild(option); }); }
+    else if (field.type === "select") {
+      input = document.createElement("select");
+      const selectOptions = schema.type === "GroupExecuter" && field.key === "groupId"
+        ? buildGroupOptions({ includePlaceholder: true })
+        : (field.options || []);
+      selectOptions.forEach((opt) => {
+        const option = document.createElement("option");
+        option.value = String(opt.value);
+        option.textContent = String(opt.label ?? opt.value);
+        input.appendChild(option);
+      });
+      if (schema.type === "GroupExecuter" && field.key === "groupId" && !state.groups.length) {
+        input.disabled = true;
+      }
+    }
     else if (field.type === "checkbox") { input = document.createElement("input"); input.type = "checkbox"; }
     else if (field.type === "filelist") { input = document.createElement("div"); input.textContent = "Unsupported field type"; }
     else { input = document.createElement("input"); input.type = field.type === "number" ? "number" : field.type === "url" ? "url" : "text"; }
@@ -1984,7 +3270,11 @@ function buildFieldsNested(container, schema, step, ctx) {
     if (field.type === "number") { if (typeof field.min !== "undefined") input.min = String(field.min); if (typeof field.max !== "undefined") input.max = String(field.max); if (typeof field.step !== "undefined") input.step = String(field.step); }
     const existing = step[field.key];
     if (field.type === "checkbox") { if (existing !== undefined && existing !== null) input.checked = Boolean(existing); else if (field.default !== undefined) input.checked = Boolean(field.default); }
-    else if (field.type === "select") { if (existing !== undefined && existing !== null) input.value = String(existing); else if (field.default !== undefined) input.value = String(field.default); }
+    else if (field.type === "select") {
+      if (existing !== undefined && existing !== null) input.value = String(existing);
+      else if (field.default !== undefined) input.value = String(field.default);
+      else if (schema.type === "GroupExecuter" && field.key === "groupId" && state.groups[0]) input.value = state.groups[0].id;
+    }
     else { if (existing !== undefined && existing !== null) input.value = String(existing); else if (field.default !== undefined) input.value = String(field.default); }
     if (field.type === "checkbox") { input.addEventListener("change", (e) => { setDirty(true, { silent: true }); updateNestedFieldValue(ctx.parentIndex, ctx.branchKey, ctx.childIndex, field, Boolean(e.target.checked)); }); }
     else if (field.type === "select") {
@@ -2017,7 +3307,7 @@ function buildFieldsNested(container, schema, step, ctx) {
       btn.classList.toggle("active", isActive);
       btn.disabled = Boolean(state.pendingPicker) && !isActive;
       btn.addEventListener("click", () => { requestSelectorPick({ stepIndex: undefined, field, ctx }); });
-      row.appendChild(input); row.appendChild(btn);
+      row.appendChild(input); row.appendChild(createSelectorPingButton(input)); row.appendChild(btn);
 
       const st = stepRef();
       const isClickSelector = st?.type === "Click" && field.key === "selector";
@@ -2161,13 +3451,13 @@ function createDeepNestedStepCard(parentCtx, nestedKey, childIndex, step, branch
   const chipIcon = card.querySelector('.chip-icon');
   const chipLabel = card.querySelector('.chip-label');
   const key = [...(Array.isArray(parentCtx.path) ? parentCtx.path : [parentCtx.parentIndex, parentCtx.branchKey, parentCtx.childIndex]), nestedKey, childIndex].map(String).join('|');
-  const stName = state.nestedStatuses[key] || 'idle';
+  const stName = getDisplayedNestedStatus(key, schema.type);
   const meta = RUN_STATUS_META[stName] || RUN_STATUS_META.idle;
   chipIcon.textContent = meta.icon;
   let label = meta.label;
   if (schema.type === 'Wait' && stName === 'running') {
-    const sec = state.nestedWaitCountdowns?.[key];
-    if (Number.isFinite(sec) && sec > 0) label = `Running — ${sec}s`;
+    const sec = getDisplayedNestedWaitSeconds(key);
+    if (Number.isFinite(sec)) label = `Running — ${sec}s`;
   }
   chipLabel.textContent = label;
   chip.className = `status-chip ${meta.className}`;
@@ -2312,6 +3602,19 @@ function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childInd
     if (schema.type === 'FillText' && (field.key === 'splitAcrossInputs' || field.key === 'slowType' || field.key === 'slowTypeDelayMs')) {
       return;
     }
+    if (schema.type === 'KeyPress') {
+      if (field.key === 'keys') {
+        const editor = buildKeyPressEditor({
+          stepGetter: () => getDeepNestedStep(parentCtx, nestedKey, childIndex),
+          requestRender: () => render()
+        });
+        container.appendChild(editor);
+        return;
+      }
+      if (['repeat', 'repeatDelayMs', 'keyDelayMs', 'holdMs'].includes(field.key)) {
+        return;
+      }
+    }
 
     // For deep nested, keep it simple (no picker)
     const wrap = document.createElement('div'); wrap.className = 'field';
@@ -2376,6 +3679,7 @@ function buildFieldsDeep(container, schema, step, parentCtx, nestedKey, childInd
     if (field.supportsPicker && pickerCtx) {
       const row = document.createElement('div'); row.className = 'input-row';
       row.appendChild(input);
+      row.appendChild(createSelectorPingButton(input));
       const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'icon picker-btn'; btn.title = 'Pick element from active tab'; btn.textContent = '🎯';
       const isActive = isPickerContext(undefined, field.key, pickerCtx);
       btn.classList.toggle('active', isActive);
@@ -2592,11 +3896,13 @@ function insertStepAt(index, type = STEP_LIBRARY[0].type) {
   const newStep = createStepFromSchema(schema);
   const insertIndex = Math.max(0, Math.min(Number(index) || 0, state.steps.length));
   state.steps.splice(insertIndex, 0, newStep);
-  state.stepStatuses.splice(insertIndex, 0, "idle");
-  state.ifResults = shiftIndexedMap(state.ifResults, insertIndex, 1);
-  state.waitCountdowns = shiftIndexedMap(state.waitCountdowns, insertIndex, 1);
-  state.nestedStatuses = shiftNestedMap(state.nestedStatuses, insertIndex, 1);
-  state.nestedWaitCountdowns = shiftNestedMap(state.nestedWaitCountdowns, insertIndex, 1);
+  if (!isEditingGroup()) {
+    state.stepStatuses.splice(insertIndex, 0, "idle");
+    state.ifResults = shiftIndexedMap(state.ifResults, insertIndex, 1);
+    state.waitCountdowns = shiftIndexedMap(state.waitCountdowns, insertIndex, 1);
+    state.nestedStatuses = shiftNestedMap(state.nestedStatuses, insertIndex, 1);
+    state.nestedWaitCountdowns = shiftNestedMap(state.nestedWaitCountdowns, insertIndex, 1);
+  }
   updateEmptyState();
   return true;
 }
@@ -2611,7 +3917,9 @@ function deleteStep(index) {
     return;
   }
   state.steps.splice(index, 1);
-  state.stepStatuses.splice(index, 1);
+  if (!isEditingGroup()) {
+    state.stepStatuses.splice(index, 1);
+  }
   render();
   setDirty(true);
   showStatus("Step removed.");
@@ -2626,8 +3934,10 @@ function moveStep(index, delta) {
   if (newIndex < 0 || newIndex >= state.steps.length) return;
   const [step] = state.steps.splice(index, 1);
   state.steps.splice(newIndex, 0, step);
-  const [st] = state.stepStatuses.splice(index, 1);
-  state.stepStatuses.splice(newIndex, 0, st || "idle");
+  if (!isEditingGroup()) {
+    const [st] = state.stepStatuses.splice(index, 1);
+    state.stepStatuses.splice(newIndex, 0, st || "idle");
+  }
   render();
   setDirty(true);
 }
@@ -2662,7 +3972,7 @@ function createStepFromSchema(schema) {
     if (field.default !== undefined) {
       base[field.key] = field.type === "number" ? field.default : field.default;
     } else {
-      if (field.type === "filelist") base[field.key] = [];
+      if (field.type === "filelist" || field.type === "keysequence") base[field.key] = [];
       else base[field.key] = field.type === "number" ? "" : "";
     }
   });
@@ -2677,12 +3987,15 @@ function createStepFromSchema(schema) {
     if (base.mode == null) base.mode = 'flow';
     if (base.ifIndex == null) base.ifIndex = '';
   }
+  if (schema.type === "GroupExecuter") {
+    base.groupId = state.groups[0]?.id || "";
+  }
   return base;
 }
 
 function updateEmptyState() {
   if (!els.emptyState) return;
-  if (state.steps.length === 0) {
+  if (state.mainSteps.length === 0) {
     els.emptyState.classList.remove("hidden");
   } else {
     els.emptyState.classList.add("hidden");
@@ -3186,7 +4499,7 @@ function removeStepAtPath(path) {
   if (index < 0 || index >= array.length) return null;
   const [step] = array.splice(index, 1);
   let removedStatus = 'idle';
-  if (ctx.type === 'root') {
+  if (ctx.type === 'root' && !isEditingGroup()) {
     const [status] = state.stepStatuses.splice(index, 1);
     removedStatus = status || 'idle';
   }
@@ -3198,7 +4511,7 @@ function insertStepIntoContext(step, targetCtx, index, status = 'idle') {
   if (!array) return;
   const insertAt = Math.max(0, Math.min(index, array.length));
   array.splice(insertAt, 0, step);
-  if (targetCtx.type === 'root') {
+  if (targetCtx.type === 'root' && !isEditingGroup()) {
     state.stepStatuses.splice(insertAt, 0, status || 'idle');
   }
 }
@@ -3218,11 +4531,14 @@ function contextsMatch(a, b) {
 }
 
 function resetFlowStatuses() {
-  state.stepStatuses = state.steps.map(() => 'idle');
+  state.stepStatuses = state.mainSteps.map(() => 'idle');
   state.nestedStatuses = {};
   state.ifResults = {};
+  state.groupExecStates = {};
   state.waitCountdowns = {};
+  state.waitDeadlines = {};
   state.nestedWaitCountdowns = {};
+  state.nestedWaitDeadlines = {};
   state.lastRunIncremented = false;
 }
 
@@ -3266,6 +4582,10 @@ function setControlsDisabled(disabled) {
   toggle(els.loadDefault);
   toggle(els.exportFlow);
   toggle(els.runFlow);
+  toggle(els.createGroupBtn);
+  toggle(els.groupAddStep);
+  toggle(els.groupNameInput);
+  toggle(els.openTransferModalBtn);
   if (els.importFlow) {
     els.importFlow.disabled = disabled;
     const label = els.importFlow.closest(".import-btn");
@@ -3286,10 +4606,7 @@ function isPickerContext(stepIndex, fieldKey, ctx) {
 }
 
 function setDirty(flag, { silent } = {}) {
-  state.dirty = flag;
-  if (flag && !silent) {
-    showStatus("Unsaved changes.");
-  }
+  markWorkspaceDirty(flag, { silent });
 }
 
 function showStatus(message, { persistent = false } = {}) {
@@ -3299,33 +4616,57 @@ function showStatus(message, { persistent = false } = {}) {
     state.statusTimer = null;
   }
   els.status.textContent = message || "";
+  els.status.title = message || "";
   if (message && !persistent) {
     state.statusTimer = setTimeout(() => {
       if (!state.pendingPicker) {
         els.status.textContent = "";
+        els.status.title = "";
       }
     }, 3200);
   }
 }
 
-async function persistFlow({ steps, flowName, silent } = {}) {
-  const prepared = steps && flowName ? { steps, flowName } : validateAndPrepare();
+function summarizeStatusDetail(value, max = 72) {
+  const text = typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+async function persistFlow({ steps, flowName, groups, silent } = {}) {
+  const prepared = steps && flowName ? { steps, flowName, groups: sanitizeGroups(groups ?? state.groups) } : validateAndPrepare();
   if (!prepared) return false;
   try {
     await chrome.storage.local.set({
       activeFlow: prepared.steps,
       flowName: prepared.flowName,
+      groups: prepared.groups,
+      workspaceDraft: {
+        flowName: prepared.flowName,
+        steps: prepared.steps,
+        groups: prepared.groups,
+        selectedTab: state.activeTab || "flow",
+        selectedGroupId: state.selectedGroupId || null
+      },
       settings: state.settings
     });
-    state.steps = sanitizeFlowArray(prepared.steps);
+    state.mainSteps = sanitizeFlowArray(prepared.steps);
+    state.groups = sanitizeGroups(prepared.groups);
+    if (state.selectedGroupId && !state.groups.some((group) => group.id === state.selectedGroupId)) {
+      state.selectedGroupId = null;
+    }
+    syncEditorSteps();
     state.flowName = prepared.flowName;
-    state.stepStatuses = state.steps.map(() => "idle");
+    state.stepStatuses = state.mainSteps.map(() => "idle");
     state.nestedStatuses = {};
     state.ifResults = {};
+    state.groupExecStates = {};
     state.waitCountdowns = {};
+    state.waitDeadlines = {};
     state.nestedWaitCountdowns = {};
+    state.nestedWaitDeadlines = {};
     snapshotAsSaved();
-    state.dirty = false;
+    markWorkspaceDirty(false, { silent: true });
     if (!silent) showStatus("Flow saved to storage.");
     render();
     return true;
@@ -3334,18 +4675,6 @@ async function persistFlow({ steps, flowName, silent } = {}) {
     alert("Failed to save flow. See console for details.");
     return false;
   }
-}
-
-function restoreLastSaved() {
-  state.steps = cloneFlow(state.lastSaved.steps);
-  state.flowName = state.lastSaved.flowName;
-}
-
-function snapshotAsSaved() {
-  state.lastSaved = {
-    steps: cloneFlow(state.steps),
-    flowName: state.flowName
-  };
 }
 
 function updateGmailStatusLabel() {
@@ -3403,7 +4732,12 @@ function renderLibrary() {
     list.appendChild(card);
 
     loadBtn.addEventListener("click", () => loadSavedFlow(f.id));
-    exportBtn.addEventListener("click", () => exportFlowData(f.steps || [], f.name || "flow"));
+    exportBtn.addEventListener("click", () => exportFlowData({
+      name: f.name || "flow",
+      flowName: f.flowName || f.name || "flow",
+      steps: f.steps || [],
+      groups: f.groups || []
+    }));
     updateBtn.addEventListener("click", async () => { await updateSavedFlowWithCurrent(f.id); });
     renameBtn.addEventListener("click", async () => {
       const nn = prompt("New name", f.name || "");
@@ -3423,7 +4757,14 @@ async function saveCurrentAsNew(name) {
   const nm = (state.flowName || name || "").trim();
   if (!nm) { alert("Enter a flow name"); return; }
   const prepared = validateAndPrepare(); if (!prepared) return;
-  const item = { id: `sf_${Date.now()}_${Math.random().toString(16).slice(2)}`, name: nm, steps: prepared.steps, updatedAt: Date.now() };
+  const item = {
+    id: `sf_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    name: nm,
+    flowName: prepared.flowName,
+    steps: prepared.steps,
+    groups: prepared.groups,
+    updatedAt: Date.now()
+  };
   const cur = Array.isArray(state.savedFlows) ? state.savedFlows.slice() : [];
   cur.unshift(item);
   state.savedFlows = cur;
@@ -3454,21 +4795,32 @@ async function renameSavedFlow(id, name) {
 function loadSavedFlow(id) {
   const f = (state.savedFlows || []).find((x) => x.id === id);
   if (!f) return;
-  state.steps = sanitizeFlowArray(f.steps);
-  state.flowName = f.name || state.flowName;
-  state.stepStatuses = state.steps.map(() => "idle");
-  state.nestedStatuses = {}; state.ifResults = {}; state.waitCountdowns = {}; state.nestedWaitCountdowns = {};
-  setDirty(true);
+  state.mainSteps = sanitizeFlowArray(f.steps);
+  state.groups = sanitizeGroups(f.groups);
+  state.flowName = f.flowName || f.name || state.flowName;
+  state.selectedGroupId = null;
+  state.activeTab = "flow";
+  syncEditorSteps();
+  state.stepStatuses = state.mainSteps.map(() => "idle");
+  state.nestedStatuses = {}; state.ifResults = {}; state.groupExecStates = {}; state.waitCountdowns = {}; state.waitDeadlines = {}; state.nestedWaitCountdowns = {}; state.nestedWaitDeadlines = {};
+  markWorkspaceDirty(true);
+  selectTab("flow");
   render();
   showStatus("Loaded flow from library. Save to persist.");
 }
 
-function exportFlowData(steps, flowName) {
-  const payload = { name: flowName || "flow", steps: sanitizeFlowArray(steps) };
+function exportFlowData({ name, flowName, steps, groups }) {
+  const payload = {
+    version: 2,
+    name: name || flowName || "flow",
+    flowName: flowName || name || "flow",
+    steps: sanitizeFlowArray(steps),
+    groups: sanitizeGroups(groups)
+  };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-  link.href = url; link.download = `${slugify(flowName || 'flow')}.json`;
+  link.href = url; link.download = `${slugify(flowName || name || 'flow')}.json`;
   document.body.appendChild(link); link.click(); document.body.removeChild(link); URL.revokeObjectURL(url);
 }
 
@@ -3477,7 +4829,7 @@ async function updateSavedFlowWithCurrent(id) {
   const cur = Array.isArray(state.savedFlows) ? state.savedFlows.slice() : [];
   const idx = cur.findIndex((f) => f.id === id);
   if (idx < 0) return;
-  cur[idx] = { ...cur[idx], steps: prepared.steps, updatedAt: Date.now() };
+  cur[idx] = { ...cur[idx], flowName: prepared.flowName, steps: prepared.steps, groups: prepared.groups, updatedAt: Date.now() };
   state.savedFlows = cur;
   await chrome.storage.local.set({ savedFlows: cur });
   showStatus("Saved flow updated.");
@@ -3486,138 +4838,114 @@ async function updateSavedFlowWithCurrent(id) {
 
 function validateAndPrepare() {
   const errors = [];
-  const preparedSteps = [];
 
-  state.steps.forEach((step, index) => {
-    const schema = STEP_LIBRARY_MAP.get(step.type);
-    if (!schema) {
-      errors.push(`Step ${index + 1}: Unknown type "${step.type}".`);
-      return;
-    }
-    const prepared = { type: step.type };
-    schema.fields.forEach((field) => {
-      const value = step[field.key];
-      const isEmpty = value === null || value === undefined || (typeof value === "string" && value.trim() === "") || (field.type === "filelist" && Array.isArray(value) && value.length === 0);
-      if (field.required && isEmpty) {
-        errors.push(`Step ${index + 1}: ${field.label} is required.`);
+  function validateStepCollection(inputSteps, pathPrefix = "Step") {
+    const preparedSteps = [];
+    inputSteps.forEach((step, index) => {
+      const schema = STEP_LIBRARY_MAP.get(step?.type);
+      const labelPrefix = `${pathPrefix} ${index + 1}`;
+      if (!schema) {
+        errors.push(`${labelPrefix}: Unknown type "${step?.type}".`);
         return;
       }
-      if (field.type === "number") {
-        if (isEmpty) return;
-        const numeric = Number(value);
-        if (!Number.isFinite(numeric)) {
-          errors.push(`Step ${index + 1}: ${field.label} must be a number.`);
+      const prepared = { type: step.type };
+      schema.fields.forEach((field) => {
+        const value = step[field.key];
+        const isEmpty = value === null || value === undefined || (typeof value === "string" && value.trim() === "") || ((field.type === "filelist" || field.type === "keysequence") && Array.isArray(value) && value.length === 0);
+        if (field.required && isEmpty) {
+          errors.push(`${labelPrefix}: ${field.label} is required.`);
           return;
         }
-        if (typeof field.min === "number" && numeric < field.min) {
-          errors.push(`Step ${index + 1}: ${field.label} must be ≥ ${field.min}.`);
-          return;
+        if (field.type === "number") {
+          if (isEmpty) return;
+          const numeric = Number(value);
+          if (!Number.isFinite(numeric)) {
+            errors.push(`${labelPrefix}: ${field.label} must be a number.`);
+            return;
+          }
+          if (typeof field.min === "number" && numeric < field.min) {
+            errors.push(`${labelPrefix}: ${field.label} must be ≥ ${field.min}.`);
+            return;
+          }
+          prepared[field.key] = numeric;
+        } else if (field.type === "keysequence") {
+          if (!isEmpty) prepared[field.key] = normalizeKeySequence(value);
+        } else if (!isEmpty) {
+          prepared[field.key] = typeof value === "string" ? value.trim() : value;
         }
-        prepared[field.key] = numeric;
-      } else if (!isEmpty) {
-        prepared[field.key] = typeof value === "string" ? value.trim() : value;
+      });
+
+      if (step.type === "Click" && step.forceClick !== undefined) {
+        prepared.forceClick = Boolean(step.forceClick);
       }
+
+      if (step.type === "Complete") {
+        const outcome = step.status === "failure" ? "failure" : "success";
+        prepared.status = outcome;
+        if (typeof step.message === "string" && step.message.trim()) {
+          prepared.message = step.message.trim();
+        }
+      }
+
+      if (step.type === "GroupExecuter") {
+        const groupId = typeof step.groupId === "string" ? step.groupId : "";
+        const group = state.groups.find((item) => item.id === groupId);
+        if (!group) {
+          errors.push(`${labelPrefix}: Group selection is required.`);
+        } else {
+          prepared.groupId = group.id;
+        }
+      }
+
+      if (step.type === "If") {
+        const thenArr = Array.isArray(step.then) ? step.then : [];
+        const elseArr = Array.isArray(step.else) ? step.else : [];
+        prepared.then = validateStepCollection(thenArr, `${labelPrefix} > Then`);
+        prepared.else = validateStepCollection(elseArr, `${labelPrefix} > Else`);
+        if ((step.mode || "exists") === "text") {
+          const match = step.textMatch || "contains";
+          const val = typeof step.textValue === "string" ? step.textValue.trim() : "";
+          if (!["any", "empty", "notEmpty"].includes(match)) {
+            if (!val) errors.push(`${labelPrefix}: Text value is required when using a text condition.`);
+            else prepared.textValue = val;
+          }
+          prepared.textMatch = match;
+          prepared.textCaseSensitive = Boolean(step.textCaseSensitive);
+        }
+      }
+
+      if (step.type === "Restart") {
+        if (prepared.ifIndex === "" || prepared.ifIndex === null) {
+          delete prepared.ifIndex;
+        } else if (prepared.ifIndex !== undefined) {
+          const asNumber = Number(prepared.ifIndex);
+          if (Number.isFinite(asNumber)) prepared.ifIndex = asNumber;
+          else delete prepared.ifIndex;
+        }
+      }
+      preparedSteps.push(prepared);
     });
-    // carry per-step extras
-    if (step.type === "Click" && step.forceClick !== undefined) {
-      prepared.forceClick = Boolean(step.forceClick);
-    }
-    if (step.type === "Complete") {
-      const outcome = step.status === 'failure' ? 'failure' : 'success';
-      prepared.status = outcome;
-      if (typeof step.message === 'string' && step.message.trim()) {
-        prepared.message = step.message.trim();
-      }
-    }
-    // Recursively prepare If branches (supports nested If)
-    if (step.type === "If") {
-      const prepareChild = (child, pathLabel) => {
-        const cs = STEP_LIBRARY_MAP.get(child.type);
-        if (!cs) { errors.push(`Step ${index + 1} (${pathLabel}): Unknown type "${child.type}".`); return null; }
-        const cprep = { type: child.type };
-        cs.fields.forEach((f) => {
-          const v = child[f.key];
-          const empty = v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
-          if (f.required && empty) { errors.push(`Step ${index + 1} (${pathLabel}): ${f.label} is required.`); return; }
-          if (f.type === 'number') {
-            if (empty) return;
-            const num = Number(v);
-            if (!Number.isFinite(num)) { errors.push(`Step ${index + 1} (${pathLabel}): ${f.label} must be a number.`); return; }
-            if (typeof f.min === 'number' && num < f.min) { errors.push(`Step ${index + 1} (${pathLabel}): ${f.label} must be ≥ ${f.min}.`); return; }
-            cprep[f.key] = num;
-          } else if (!empty) {
-            cprep[f.key] = typeof v === 'string' ? v.trim() : v;
-          }
-        });
-        if (child.type === 'Click' && child.forceClick !== undefined) cprep.forceClick = Boolean(child.forceClick);
-        if (child.type === 'If') {
-          const childThen = Array.isArray(child.then) ? child.then : [];
-          const childElse = Array.isArray(child.else) ? child.else : [];
-          cprep.then = childThen.map((g, gi) => prepareChild(g, `${pathLabel} > Then ${gi + 1}`)).filter(Boolean);
-          cprep.else = childElse.map((g, gi) => prepareChild(g, `${pathLabel} > Else ${gi + 1}`)).filter(Boolean);
-          const childMode = child.mode || 'exists';
-          if (childMode === 'text') {
-            const match = child.textMatch || 'contains';
-            const childVal = typeof child.textValue === 'string' ? child.textValue.trim() : '';
-            if (!['any', 'empty', 'notEmpty'].includes(match)) {
-              if (!childVal) {
-                errors.push(`Step ${index + 1} (${pathLabel}): Text value is required when using a text condition.`);
-              } else {
-                cprep.textValue = childVal;
-              }
-            }
-            cprep.textMatch = match;
-            cprep.textCaseSensitive = Boolean(child.textCaseSensitive);
-          }
-        } else if (child.type === 'Complete') {
-          const outcome = child.status === 'failure' ? 'failure' : 'success';
-          cprep.status = outcome;
-          if (typeof child.message === 'string' && child.message.trim()) {
-            cprep.message = child.message.trim();
-          }
-        }
-        return cprep;
-      };
-      const tArr = Array.isArray(step.then) ? step.then : [];
-      const eArr = Array.isArray(step.else) ? step.else : [];
-      prepared.then = tArr.map((c, ci) => prepareChild(c, `Then ${ci + 1}`)).filter(Boolean);
-      prepared.else = eArr.map((c, ci) => prepareChild(c, `Else ${ci + 1}`)).filter(Boolean);
-      if ((step.mode || 'exists') === 'text') {
-        const match = step.textMatch || 'contains';
-        const val = typeof step.textValue === 'string' ? step.textValue.trim() : '';
-        if (!['any', 'empty', 'notEmpty'].includes(match)) {
-          if (!val) errors.push(`Step ${index + 1}: Text value is required when using a text condition.`);
-          else prepared.textValue = val;
-        }
-        prepared.textMatch = match;
-        prepared.textCaseSensitive = Boolean(step.textCaseSensitive);
-      }
-    }
-    if (prepared.type === 'Restart') {
-      if (prepared.ifIndex === '' || prepared.ifIndex === null) {
-        delete prepared.ifIndex;
-      } else if (prepared.ifIndex !== undefined) {
-        const asNumber = Number(prepared.ifIndex);
-        if (Number.isFinite(asNumber)) prepared.ifIndex = asNumber;
-        else delete prepared.ifIndex;
-      }
-    }
-    preparedSteps.push(prepared);
-  });
+    return preparedSteps;
+  }
+
+  const flowName = state.flowName && state.flowName.trim() ? state.flowName.trim() : DEFAULT_FLOW_NAME;
+  const preparedSteps = validateStepCollection(state.mainSteps, "Main flow step");
+  const preparedGroups = state.groups.map((group, groupIndex) => ({
+    id: group.id,
+    name: typeof group.name === "string" && group.name.trim() ? group.name.trim() : `Group ${groupIndex + 1}`,
+    steps: validateStepCollection(group.steps || [], `Group "${typeof group.name === "string" && group.name.trim() ? group.name.trim() : `Group ${groupIndex + 1}`}" step`)
+  }));
+
+  if (!preparedSteps.length) {
+    errors.push("Add at least one step to the main flow before saving or running.");
+  }
 
   if (errors.length) {
     alert("Fix the following issues before saving:\n\n" + errors.join("\n"));
     return null;
   }
 
-  const flowName = state.flowName && state.flowName.trim() ? state.flowName.trim() : DEFAULT_FLOW_NAME;
-
-  if (!preparedSteps.length) {
-    alert("Add at least one step before saving or running the flow.");
-    return null;
-  }
-
-  return { steps: preparedSteps, flowName };
+  return { steps: preparedSteps, flowName, groups: preparedGroups };
 }
 
 function listTopLevelIfs() {
@@ -3628,6 +4956,62 @@ function listTopLevelIfs() {
     }
   }
   return res;
+}
+
+function createSelectorPingButton(input) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "icon ping-btn";
+  btn.title = "Ping selector target in active tab";
+  btn.setAttribute("aria-label", "Ping selector target in active tab");
+  btn.textContent = "📍";
+
+  const syncState = () => {
+    btn.disabled = Boolean(state.pendingPicker) || !String(input?.value || "").trim();
+  };
+  syncState();
+
+  input.addEventListener("input", syncState);
+  input.addEventListener("change", syncState);
+  btn.addEventListener("click", async () => {
+    await pingSelectorValue(String(input?.value || "").trim());
+    syncState();
+  });
+  return btn;
+}
+
+async function pingSelectorValue(selector) {
+  if (state.pendingPicker) {
+    alert("Finish the element picker first.");
+    return;
+  }
+  const normalizedSelector = typeof selector === "string" ? selector.trim() : "";
+  if (!normalizedSelector) {
+    alert("Enter a selector first.");
+    return;
+  }
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) {
+      alert("No active tab found. Open a regular webpage and try again.");
+      return;
+    }
+    const res = await chrome.runtime.sendMessage({
+      type: "PING_SELECTOR_IN_TAB",
+      tabId: tab.id,
+      selector: normalizedSelector,
+      readInsideIframes: state.settings.readInsideIframes !== false
+    });
+    if (res && res.ok === false) {
+      alert(res?.error || "Selector target could not be found.");
+      return;
+    }
+    const summary = summarizeStatusDetail(normalizedSelector, 56);
+    showStatus(summary ? `Pinged ${summary}` : `Pinged ${res?.description || "selector target"}.`);
+  } catch (err) {
+    console.error("[options] Failed to ping selector:", err);
+    alert(err?.message || "Failed to ping selector.");
+  }
 }
 
 async function requestSelectorPick({ stepIndex, field, ctx }) {
@@ -3702,14 +5086,16 @@ function handlePickerResult(msg) {
         arr[pending.nested.childIndex][fieldKey] = msg.selector;
         setDirty(true, { silent: true });
         render();
-        showStatus(`Selector captured: ${msg.selector}`);
+        const summary = summarizeStatusDetail(msg.selector, 56);
+        showStatus(summary ? `Selector captured: ${summary}` : "Selector captured.");
         return;
       }
     } else if (typeof stepIndex === 'number' && state.steps[stepIndex]) {
       state.steps[stepIndex][fieldKey] = msg.selector;
       setDirty(true, { silent: true });
       render();
-      showStatus(`Selector captured: ${msg.selector}`);
+      const summary = summarizeStatusDetail(msg.selector, 56);
+      showStatus(summary ? `Selector captured: ${summary}` : "Selector captured.");
       return;
     }
     render();
@@ -3744,6 +5130,8 @@ function sanitizeFlowArray(value) {
               dataUrl: typeof f?.dataUrl === "string" && f.dataUrl.startsWith("data:") ? f.dataUrl : ""
             }))
             .filter((f) => f.dataUrl);
+        } else if (field.type === "keysequence") {
+          normalized[field.key] = normalizeKeySequence(step[field.key]);
         } else {
           normalized[field.key] = step[field.key];
         }
@@ -3771,43 +5159,39 @@ function sanitizeFlowArray(value) {
   return sanitized;
 }
 
-function cloneFlow(flow) {
-  return Array.isArray(flow) ? flow.map((step) => ({ ...step })) : [];
-}
-
 function exportFlow() {
-  const prepared = validateAndPrepare();
-  if (!prepared) return;
-  const stepsOut = prepared.steps.map((s, i) => {
-    const src = state.steps[i] || {};
-    return s.type === "Click" && src.forceClick !== undefined ? { ...s, forceClick: Boolean(src.forceClick) } : s;
+  exportFlowData({
+    name: state.flowName,
+    flowName: state.flowName,
+    steps: state.mainSteps,
+    groups: state.groups
   });
-  const payload = { name: prepared.flowName, steps: stepsOut };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `${slugify(prepared.flowName)}.json`;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
   showStatus("Flow exported as JSON.");
 }
 
 function applyImportedFlow(payload) {
   const importedSteps = Array.isArray(payload) ? payload : Array.isArray(payload?.steps) ? payload.steps : null;
   if (!importedSteps) throw new Error("Missing steps array.");
-  const importedName = typeof payload?.name === "string" ? payload.name : DEFAULT_FLOW_NAME;
+  const importedName = typeof payload?.flowName === "string" && payload.flowName.trim()
+    ? payload.flowName.trim()
+    : (typeof payload?.name === "string" && payload.name.trim() ? payload.name.trim() : DEFAULT_FLOW_NAME);
   const sanitized = sanitizeFlowArray(importedSteps);
   if (!sanitized.length) throw new Error("No valid steps in file.");
-  state.steps = sanitized;
+  state.mainSteps = sanitized;
+  state.groups = sanitizeGroups(payload?.groups);
   state.flowName = importedName;
-  state.stepStatuses = state.steps.map(() => "idle");
+  state.activeTab = "flow";
+  state.selectedGroupId = null;
+  syncEditorSteps();
+  state.stepStatuses = state.mainSteps.map(() => "idle");
   state.nestedStatuses = {};
   state.ifResults = {};
+  state.groupExecStates = {};
   state.waitCountdowns = {};
+  state.waitDeadlines = {};
   state.nestedWaitCountdowns = {};
+  state.nestedWaitDeadlines = {};
+  selectTab("flow");
 }
 
 function slugify(text) {
@@ -3826,11 +5210,14 @@ async function triggerRunFlow() {
     return false;
   }
   // reset statuses to pending
-  state.stepStatuses = state.steps.map(() => "pending");
+  state.stepStatuses = state.mainSteps.map(() => "pending");
   state.nestedStatuses = {};
   state.ifResults = {};
+  state.groupExecStates = {};
   state.waitCountdowns = {};
+  state.waitDeadlines = {};
   state.nestedWaitCountdowns = {};
+  state.nestedWaitDeadlines = {};
   render();
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -3856,35 +5243,49 @@ async function triggerRunFlow() {
 }
 
 // tabs helpers
-function initTabs() { selectTab("flow"); }
+function initTabs() { selectTab(state.activeTab || "flow"); }
 
 function selectTab(name) {
   const isFlow = name === "flow";
+  const isGroups = name === "groups";
   const isSettings = name === "settings";
   const isLibrary = name === "library";
   state.activeTab = name;
+  if (name !== "groups") state.transferModal.open = false;
+  if (isGroups && state.selectedGroupId && !getSelectedGroup()) {
+    state.selectedGroupId = null;
+  }
+  syncEditorSteps();
   // toggle buttons
   els.tabFlowBtn?.classList.toggle("active", isFlow);
+  els.tabGroupsBtn?.classList.toggle("active", isGroups);
   els.tabSettingsBtn?.classList.toggle("active", isSettings);
   els.tabLibraryBtn?.classList.toggle("active", isLibrary);
   // toggle panels
   els.tabFlow?.classList.toggle("hidden", !isFlow);
+  els.tabGroups?.classList.toggle("hidden", !isGroups);
   els.tabSettings?.classList.toggle("hidden", !isSettings);
   els.tabLibrary?.classList.toggle("hidden", !isLibrary);
   if (isLibrary) {
     try { renderLibrary(); } catch {}
   }
+  scheduleWorkspaceDraftSave();
   updateControlsForTab();
 }
 
 function updateControlsForTab() {
   const tab = state.activeTab || 'flow';
   const showFlowControls = tab === 'flow';
-  const showSaveBar = tab !== 'library'; // show Save/Discard on flow + settings
+  const showGroupsControls = tab === 'groups' && Boolean(state.selectedGroupId);
+  const showSaveBar = tab !== 'library'; // show Save/Discard on flow + groups + settings
   // top
   if (els.addStep) els.addStep.style.display = showFlowControls ? '' : 'none';
   if (els.runFlow) els.runFlow.style.display = showFlowControls ? '' : 'none';
   if (els.runCounter) els.runCounter.style.display = showFlowControls ? '' : 'none';
+  if (els.flowNameWrap) els.flowNameWrap.style.display = showFlowControls ? '' : 'none';
+  if (els.topBar) els.topBar.style.display = (showFlowControls || tab === 'settings' || tab === 'library') ? '' : '';
+  if (els.moreMenuBtn) els.moreMenuBtn.style.display = showFlowControls ? '' : 'none';
+  if (els.groupAddStep) els.groupAddStep.style.display = showGroupsControls ? '' : 'none';
   // bottom save/discard
   const saveBtn = els.saveFlow; const discardBtn = els.discardChanges;
   if (saveBtn) saveBtn.style.display = showSaveBar ? '' : 'none';
@@ -3907,15 +5308,19 @@ function updateRunButton() {
 // Flow status handling messages from background
 function handleFlowStatus(msg) {
   if (msg.kind === "FLOW_RESET") {
-    state.stepStatuses = state.steps.map(() => "pending");
+    state.stepStatuses = state.mainSteps.map(() => "pending");
     state.nestedStatuses = {};
     state.ifResults = {};
+    state.groupExecStates = {};
     state.waitCountdowns = {};
+    state.waitDeadlines = {};
     state.nestedWaitCountdowns = {};
+    state.nestedWaitDeadlines = {};
     state.isRunning = true;
     state.lastRunIncremented = false;
     state.stopSuppressUntil = 0;
     state.inlineInsertActive = false;
+    syncCountdownTicker();
     updateRunButton();
     render();
     return;
@@ -3928,18 +5333,19 @@ function handleFlowStatus(msg) {
     state.stepStatuses[idx] = status;
     if (status === 'success' || status === 'error') {
       delete state.waitCountdowns[idx];
+      delete state.waitDeadlines[idx];
     }
     if (status === 'error' && msg.error) {
       const raw = typeof msg.error === 'string' ? msg.error : '';
       const cleaned = raw.replace(/^Error:\s*/, '').trim();
-      const stepLabel = state.steps[idx]?.type ? `${state.steps[idx].type} failed` : 'Step failed';
+      const stepLabel = state.mainSteps[idx]?.type ? `${state.mainSteps[idx].type} failed` : 'Step failed';
       const message = cleaned ? `${stepLabel}: ${cleaned}` : stepLabel;
       showStatus(message, { persistent: true });
     }
     // update running state: if any step pending/running -> running; else -> stopped
     const anyActive = state.stepStatuses.some(s => s === 'pending' || s === 'running');
     // If final step just marked success and nothing active, ensure counter increments once
-    const isFinalSuccess = (idx === state.steps.length - 1) && (status === 'success') && !anyActive;
+    const isFinalSuccess = (idx === state.mainSteps.length - 1) && (status === 'success') && !anyActive;
     if (isFinalSuccess && !state.lastRunIncremented) {
       state.runCount = (Number(state.runCount) || 0) + 1;
       state.lastRunIncremented = true;
@@ -3947,7 +5353,67 @@ function handleFlowStatus(msg) {
     // Suppress transient running flips right after STOP was requested
     const suppress = state.stopSuppressUntil && Date.now() < state.stopSuppressUntil;
     state.isRunning = suppress ? false : anyActive;
+    syncCountdownTicker();
     updateRunButton();
+    render();
+  }
+}
+
+function handleGroupExecStatus(msg) {
+  if (typeof msg.parentIndex !== "number") return;
+  const index = msg.parentIndex;
+  const current = state.groupExecStates[index] || {
+    groupId: msg.groupId || "",
+    groupName: msg.groupName || "",
+    total: Number(msg.total) || 0,
+    current: 0,
+    status: "idle",
+    items: []
+  };
+  if (msg.action === "start") {
+    state.groupExecStates[index] = {
+      groupId: msg.groupId || current.groupId,
+      groupName: msg.groupName || current.groupName,
+      total: Number(msg.total) || 0,
+      current: Number(msg.current) || 0,
+      status: "running",
+      items: Array.isArray(msg.items)
+        ? msg.items.map((item) => ({
+            index: Number.isFinite(Number(item?.index)) ? Number(item.index) : -1,
+            label: item?.label || "Step",
+            status: RUN_STATUS_META[item?.status] ? item.status : "idle"
+          }))
+        : []
+    };
+    render();
+    return;
+  }
+  if (msg.action === "item") {
+    const next = {
+      ...current,
+      current: Number.isFinite(Number(msg.current)) ? Number(msg.current) : current.current,
+      total: Number.isFinite(Number(msg.total)) ? Number(msg.total) : current.total,
+      status: msg.status === "error" ? "error" : "running",
+      items: Array.isArray(current.items) ? current.items.slice() : []
+    };
+    const itemIndex = Number(msg.itemIndex);
+    if (Number.isFinite(itemIndex) && next.items[itemIndex]) {
+      next.items[itemIndex] = {
+        ...next.items[itemIndex],
+        status: RUN_STATUS_META[msg.status] ? msg.status : next.items[itemIndex].status
+      };
+    }
+    state.groupExecStates[index] = next;
+    render();
+    return;
+  }
+  if (msg.action === "finish") {
+    state.groupExecStates[index] = {
+      ...current,
+      current: Number.isFinite(Number(msg.current)) ? Number(msg.current) : current.current,
+      total: Number.isFinite(Number(msg.total)) ? Number(msg.total) : current.total,
+      status: RUN_STATUS_META[msg.status] ? msg.status : current.status
+    };
     render();
   }
 }
@@ -3960,7 +5426,9 @@ function handleFlowNestedStatus(msg) {
   state.nestedStatuses[key] = status;
   if (status === 'success' || status === 'error') {
     delete state.nestedWaitCountdowns[key];
+    delete state.nestedWaitDeadlines[key];
   }
+  syncCountdownTicker();
   render();
 }
 
@@ -3978,6 +5446,10 @@ function handleWaitCountdown(msg) {
   const sec = Number(msg.seconds);
   if (!Number.isFinite(sec)) return;
   state.waitCountdowns[idx] = Math.max(0, sec);
+  if (Number.isFinite(Number(msg.until))) {
+    state.waitDeadlines[idx] = Number(msg.until);
+  }
+  syncCountdownTicker();
   render();
 }
 
@@ -3987,6 +5459,10 @@ function handleWaitNestedCountdown(msg) {
   const sec = Number(msg.seconds);
   if (!Number.isFinite(sec)) return;
   state.nestedWaitCountdowns[key] = Math.max(0, sec);
+  if (Number.isFinite(Number(msg.until))) {
+    state.nestedWaitDeadlines[key] = Number(msg.until);
+  }
+  syncCountdownTicker();
   render();
 }
 
@@ -4010,7 +5486,10 @@ function handleFlowComplete(msg) {
     }
   }
   state.waitCountdowns = {};
+  state.waitDeadlines = {};
   state.nestedWaitCountdowns = {};
+  state.nestedWaitDeadlines = {};
+  syncCountdownTicker();
   if (msg.outcome !== 'success') {
     state.lastRunIncremented = false;
   }

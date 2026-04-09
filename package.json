@@ -1,6 +1,6 @@
 {
   "name": "autofiller",
-  "version": "0.3.4",
+  "version": "0.3.26",
   "private": true,
   "description": "Chrome extension for reusable browser automation flows and repetitive form workflows.",
   "scripts": {

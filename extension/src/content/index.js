@@ -2,6 +2,7 @@
 
 let __audioUnlocked = false;
 let __selectorPicker = null;
+let __selectorPing = null;
 const FRAME_BRIDGE_SOURCE = "__AF_FRAME_BRIDGE__";
 const FRAME_BRIDGE_TIMEOUT_MS = 10000;
 const __frameBridgePending = new Map();
@@ -13,6 +14,317 @@ const cssEscape = (value) => {
     }
     return value.replace(/[\0-\x1F\x7F"\'\\]/g, "\\$&");
 };
+
+function normalizeNodeText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function decodeCssEscapes(value) {
+    return String(value || "").replace(/\\([0-9a-fA-F]{1,6}\s?|.)/g, (_, token) => {
+        const hex = String(token).trim();
+        if (/^[0-9a-fA-F]{1,6}$/.test(hex)) {
+            try { return String.fromCodePoint(parseInt(hex, 16)); } catch {}
+        }
+        return token.slice(-1);
+    });
+}
+
+const IDENTIFIER_NOISE_TOKENS = new Set([
+    "intent",
+    "render",
+    "switchrender",
+    "case",
+    "cases",
+    "true",
+    "false",
+    "compute",
+    "instance",
+    "instances",
+    "create",
+    "platform",
+    "image",
+    "images",
+    "table",
+    "cell",
+    "fragment",
+    "flex",
+    "jetdiv",
+    "td",
+    "tr",
+    "div",
+    "span",
+    "iframe",
+    "frame",
+    "internal",
+    "selector",
+    "content",
+    "container",
+    "component",
+    "wrapper",
+    "layout",
+    "item",
+    "node",
+    "value",
+    "label",
+    "input",
+    "button",
+    "row",
+    "col"
+]);
+
+const TRANSIENT_CLASS_TOKENS = [
+    "hover",
+    "active",
+    "focus",
+    "focused",
+    "selected",
+    "current",
+    "open",
+    "opened",
+    "expanded",
+    "collapsed",
+    "disabled",
+    "drag",
+    "drop",
+    "pressed",
+    "checking",
+    "checked"
+];
+
+function isSmartTextSelector(selector) {
+    return typeof selector === "string" && selector.startsWith("af-text(") && selector.endsWith(")");
+}
+
+function parseSmartTextSelector(selector) {
+    if (!isSmartTextSelector(selector)) return null;
+    const inner = selector.slice("af-text(".length, -1);
+    const params = new URLSearchParams(inner);
+    const text = params.get("text");
+    if (!text) return null;
+    const tag = (params.get("tag") || "*").trim().toLowerCase();
+    const index = Number(params.get("index") || 0);
+    const match = (params.get("match") || "exact").trim().toLowerCase();
+    return {
+        tag: tag || "*",
+        text,
+        index: Number.isFinite(index) && index >= 0 ? index : 0,
+        match: match === "contains" ? "contains" : "exact"
+    };
+}
+
+function isLikelyDynamicToken(token) {
+    const raw = String(token || "").trim();
+    if (!raw) return true;
+    const lower = raw.toLowerCase();
+    if (IDENTIFIER_NOISE_TOKENS.has(lower)) return true;
+    if (/^\d+$/.test(raw)) return raw.length > 2;
+    if (/^[a-f0-9]{8,}$/i.test(raw)) return true;
+    if (/^[a-z0-9]{10,}$/i.test(raw) && /\d/.test(raw)) return true;
+    if ((raw.match(/\d/g) || []).length >= Math.ceil(raw.length / 3) && raw.length >= 6) return true;
+    return false;
+}
+
+function isLikelyTransientClassName(className) {
+    const lower = String(className || "").trim().toLowerCase();
+    if (!lower) return false;
+    return TRANSIENT_CLASS_TOKENS.some((token) => lower === token || lower.includes(token));
+}
+
+function getStableClassNames(node) {
+    return Array.from(node?.classList || []).filter((className) => {
+        if (!className) return false;
+        if (isLikelyTransientClassName(className)) return false;
+        return true;
+    });
+}
+
+function stripTransientClassesFromSelector(selector) {
+    if (typeof selector !== "string" || !selector.includes(".")) return selector;
+    return selector.replace(/\.((?:\\.|[A-Za-z0-9_-])+)/g, (fullMatch, rawName) => {
+        const decodedName = decodeCssEscapes(rawName);
+        return isLikelyTransientClassName(decodedName) ? "" : fullMatch;
+    }).replace(/\s{2,}/g, " ").trim();
+}
+
+function extractReadableTextHintFromIdentifier(value) {
+    const decoded = decodeCssEscapes(String(value || ""));
+    if (!decoded) return "";
+    const normalized = decoded
+        .replace(/([a-z])([A-Z])/g, "$1 $2")
+        .replace(/[^a-zA-Z0-9.]+/g, " ");
+    const tokens = normalized
+        .split(/\s+/)
+        .map((token) => token.trim())
+        .filter(Boolean)
+        .filter((token) => !isLikelyDynamicToken(token));
+    return normalizeNodeText(tokens.join(" "));
+}
+
+function buildSmartTextSelectorFromText(text, { tag = "*", index = 0, match = "contains" } = {}) {
+    const normalizedText = normalizeNodeText(text);
+    if (!normalizedText) return "";
+    const params = new URLSearchParams({
+        tag: (tag || "*").trim().toLowerCase(),
+        text: normalizedText,
+        index: String(Math.max(0, Number(index) || 0)),
+        match: match === "exact" ? "exact" : "contains"
+    });
+    return `af-text(${params.toString()})`;
+}
+
+function querySmartTextAll(rootDocument, selector) {
+    const parsed = parseSmartTextSelector(selector);
+    if (!parsed || !rootDocument?.querySelectorAll) return [];
+    let nodes = [];
+    try {
+        nodes = Array.from(rootDocument.querySelectorAll(parsed.tag || "*"));
+    } catch {
+        return [];
+    }
+    return nodes.filter((node) => {
+        const text = normalizeNodeText(node.innerText || node.textContent);
+        if (!text) return false;
+        return parsed.match === "contains" ? text.includes(parsed.text) : text === parsed.text;
+    });
+}
+
+function querySmartText(rootDocument, selector) {
+    const parsed = parseSmartTextSelector(selector);
+    if (!parsed) return null;
+    const matches = querySmartTextAll(rootDocument, selector);
+    return matches[parsed.index] || null;
+}
+
+function parseLegacyDynamicIdSelector(selector) {
+    if (typeof selector !== "string") return null;
+    const trimmed = selector.trim();
+    if (!trimmed.startsWith("#")) return null;
+    const decoded = decodeCssEscapes(trimmed.slice(1));
+    if (!isLikelyDynamicId(decoded)) return null;
+    const text = extractReadableTextHintFromIdentifier(decoded);
+    if (!text) return null;
+    return { text, index: 0 };
+}
+
+function parseExactAttributeSelector(selector) {
+    if (typeof selector !== "string") return null;
+    const trimmed = selector.trim();
+    const match = trimmed.match(/^\[\s*([^~|^$*\]=\s]+)\s*=\s*(['"])([\s\S]*)\2\s*\]$/);
+    if (!match) return null;
+    return {
+        attribute: match[1],
+        value: decodeCssEscapes(match[3])
+    };
+}
+
+function parseLegacyDynamicAttributeSelector(selector) {
+    const parsed = parseExactAttributeSelector(selector);
+    if (!parsed || !isLikelyDynamicId(parsed.value)) return null;
+    const text = extractReadableTextHintFromIdentifier(parsed.value);
+    if (!text) return null;
+    return {
+        attribute: parsed.attribute,
+        text,
+        index: 0
+    };
+}
+
+function querySelectorSmart(rootDocument, selector) {
+    if (!rootDocument || !selector) return null;
+    if (isSmartTextSelector(selector)) {
+        return querySmartText(rootDocument, selector);
+    }
+    try {
+        const exactMatch = rootDocument.querySelector(selector);
+        if (exactMatch) return exactMatch;
+    } catch {
+        // fall through to heuristic fallback
+    }
+    const strippedSelector = stripTransientClassesFromSelector(selector);
+    if (strippedSelector && strippedSelector !== selector) {
+        try {
+            const strippedMatch = rootDocument.querySelector(strippedSelector);
+            if (strippedMatch) return strippedMatch;
+        } catch {
+            // continue with heuristic fallback
+        }
+    }
+    const legacyDynamicId = parseLegacyDynamicIdSelector(selector);
+    if (legacyDynamicId) {
+        return querySmartText(rootDocument, buildSmartTextSelectorFromText(legacyDynamicId.text, { index: legacyDynamicId.index }));
+    }
+    const legacyDynamicAttribute = parseLegacyDynamicAttributeSelector(selector);
+    if (legacyDynamicAttribute) {
+        return querySmartText(rootDocument, buildSmartTextSelectorFromText(legacyDynamicAttribute.text, { index: legacyDynamicAttribute.index }));
+    }
+    return null;
+}
+
+function querySelectorAllSmart(rootDocument, selector) {
+    if (!rootDocument || !selector) return [];
+    if (isSmartTextSelector(selector)) {
+        return querySmartTextAll(rootDocument, selector);
+    }
+    try {
+        const exactMatches = Array.from(rootDocument.querySelectorAll(selector));
+        if (exactMatches.length) return exactMatches;
+    } catch {
+        // fall through to heuristic fallback
+    }
+    const strippedSelector = stripTransientClassesFromSelector(selector);
+    if (strippedSelector && strippedSelector !== selector) {
+        try {
+            const strippedMatches = Array.from(rootDocument.querySelectorAll(strippedSelector));
+            if (strippedMatches.length) return strippedMatches;
+        } catch {
+            // continue with heuristic fallback
+        }
+    }
+    const legacyDynamicId = parseLegacyDynamicIdSelector(selector);
+    if (legacyDynamicId) {
+        return querySmartTextAll(rootDocument, buildSmartTextSelectorFromText(legacyDynamicId.text, { index: legacyDynamicId.index }));
+    }
+    const legacyDynamicAttribute = parseLegacyDynamicAttributeSelector(selector);
+    if (legacyDynamicAttribute) {
+        return querySmartTextAll(rootDocument, buildSmartTextSelectorFromText(legacyDynamicAttribute.text, { index: legacyDynamicAttribute.index }));
+    }
+    return [];
+}
+
+function isLikelyDynamicId(id) {
+    if (!id) return false;
+    const tokens = String(id)
+        .split(/[\s_:\-.]+/g)
+        .map((token) => token.trim())
+        .filter(Boolean);
+    return tokens.some((token) => isLikelyDynamicToken(token));
+}
+
+function buildSmartTextSelector(node, preferredText = "") {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return "";
+    const text = normalizeNodeText(preferredText || node.innerText || node.textContent);
+    if (!text || text.length > 120) return "";
+    const nodeDoc = node.ownerDocument || document;
+    const tag = node.tagName.toLowerCase();
+    let candidates = [];
+    try {
+        candidates = Array.from(nodeDoc.querySelectorAll(tag)).filter((candidate) => normalizeNodeText(candidate.innerText || candidate.textContent) === text);
+    } catch {
+        return "";
+    }
+    let match = "exact";
+    if (!candidates.length && preferredText) {
+        try {
+            candidates = Array.from(nodeDoc.querySelectorAll(tag)).filter((candidate) => normalizeNodeText(candidate.innerText || candidate.textContent).includes(text));
+            match = "contains";
+        } catch {
+            return "";
+        }
+    }
+    const index = candidates.indexOf(node);
+    if (index < 0) return "";
+    return buildSmartTextSelectorFromText(text, { tag, index, match });
+}
 
 function shouldReadInsideIframes(step) {
     return step?.readInsideIframes !== false;
@@ -114,18 +426,12 @@ function querySelectorAcrossDocuments(selector, options = {}) {
     if (!selector || typeof selector !== "string") return null;
     const scoped = resolveScopedSelectorContext(selector, options);
     if (scoped?.scoped) {
-        try {
-            return scoped.document.querySelector(scoped.finalSelector);
-        } catch {
-            return null;
-        }
+        return querySelectorSmart(scoped.document, scoped.finalSelector);
     }
     const docs = collectSearchDocuments(options);
     for (const doc of docs) {
-        try {
-            const el = doc.querySelector(scoped?.finalSelector || selector);
-            if (el) return el;
-        } catch {}
+        const el = querySelectorSmart(doc, scoped?.finalSelector || selector);
+        if (el) return el;
     }
     return null;
 }
@@ -134,18 +440,12 @@ function querySelectorAllAcrossDocuments(selector, options = {}) {
     if (!selector || typeof selector !== "string") return [];
     const scoped = resolveScopedSelectorContext(selector, options);
     if (scoped?.scoped) {
-        try {
-            return Array.from(scoped.document.querySelectorAll(scoped.finalSelector));
-        } catch {
-            return [];
-        }
+        return querySelectorAllSmart(scoped.document, scoped.finalSelector);
     }
     const docs = collectSearchDocuments(options);
     const matches = [];
     for (const doc of docs) {
-        try {
-            matches.push(...Array.from(doc.querySelectorAll(scoped?.finalSelector || selector)));
-        } catch {}
+        matches.push(...querySelectorAllSmart(doc, scoped?.finalSelector || selector));
     }
     return matches;
 }
@@ -202,7 +502,27 @@ function getElementRectInTopViewport(el) {
 function buildSelectorInDocument(node) {
     if (!node || node.nodeType !== Node.ELEMENT_NODE) return "";
     const nodeDoc = node.ownerDocument || document;
-    if (node.id) return `#${cssEscape(node.id)}`;
+    if (node.id && !isLikelyDynamicId(node.id)) return `#${cssEscape(node.id)}`;
+
+    const stableAttr = ["data-testid", "data-test-id", "aria-label", "name"]
+        .map((attr) => [attr, node.getAttribute?.(attr)])
+        .find(([, value]) => typeof value === "string" && value.trim() && !isLikelyDynamicId(value.trim()));
+    if (stableAttr) {
+        return `[${stableAttr[0]}="${cssEscape(stableAttr[1].trim())}"]`;
+    }
+
+    const hintText = extractReadableTextHintFromIdentifier(node.id)
+        || ["data-testid", "data-test-id", "aria-label", "name"]
+            .map((attr) => extractReadableTextHintFromIdentifier(node.getAttribute?.(attr)))
+            .find(Boolean)
+        || extractReadableTextHintFromIdentifier(Array.from(node.classList || []).join(" "));
+    if (hintText) {
+        const hintedSmartTextSelector = buildSmartTextSelector(node, hintText);
+        if (hintedSmartTextSelector) return hintedSmartTextSelector;
+    }
+
+    const smartTextSelector = buildSmartTextSelector(node);
+    if (smartTextSelector) return smartTextSelector;
 
     const segments = [];
     let current = node;
@@ -210,8 +530,9 @@ function buildSelectorInDocument(node) {
 
     while (current && current.nodeType === Node.ELEMENT_NODE && depth < 10) {
         let segment = current.tagName.toLowerCase();
-        if (current.classList.length) {
-            const classNames = Array.from(current.classList)
+        const stableClasses = getStableClassNames(current);
+        if (stableClasses.length) {
+            const classNames = stableClasses
                 .filter(Boolean)
                 .slice(0, 2)
                 .map((cls) => `.${cssEscape(cls)}`)
@@ -489,6 +810,70 @@ function positionHighlight(target, highlight) {
     highlight.style.height = `${Math.max(rect.height, 0)}px`;
 }
 
+function ensureSelectorPingHighlight() {
+    const existing = document.getElementById("__af-selector-ping-highlight");
+    if (existing) return existing;
+    const highlight = document.createElement("div");
+    highlight.id = "__af-selector-ping-highlight";
+    Object.assign(highlight.style, {
+        position: "fixed",
+        left: "0px",
+        top: "0px",
+        width: "0px",
+        height: "0px",
+        pointerEvents: "none",
+        zIndex: "2147483646",
+        border: "3px solid rgba(38, 132, 255, 0.95)",
+        background: "rgba(38, 132, 255, 0.12)",
+        borderRadius: "8px",
+        boxShadow: "0 0 0 2px rgba(255,255,255,0.7), 0 0 0 10px rgba(38, 132, 255, 0.18)",
+        transition: "opacity 180ms ease",
+        opacity: "0",
+        display: "none"
+    });
+    document.body.appendChild(highlight);
+    return highlight;
+}
+
+function hideSelectorPingHighlight() {
+    if (!__selectorPing?.highlight) return;
+    const { highlight, timeoutId } = __selectorPing;
+    if (timeoutId) clearTimeout(timeoutId);
+    highlight.style.opacity = "0";
+    highlight.style.display = "none";
+    __selectorPing = { highlight, timeoutId: null };
+}
+
+async function pingResolvedSelector(selector, { includeIframes = true } = {}) {
+    if (!selector || typeof selector !== "string") {
+        return { ok: false, error: "invalid_selector" };
+    }
+    const el = querySelectorAcrossDocuments(selector, { includeIframes });
+    if (!el) {
+        hideSelectorPingHighlight();
+        return { ok: false, error: "Selector not found on the page." };
+    }
+    scrollIntoViewAcrossFrames(el);
+    await sleep(80);
+    const highlight = ensureSelectorPingHighlight();
+    positionHighlight(el, highlight);
+    highlight.style.display = "block";
+    requestAnimationFrame(() => {
+        highlight.style.opacity = "1";
+    });
+    if (__selectorPing?.timeoutId) clearTimeout(__selectorPing.timeoutId);
+    const timeoutId = setTimeout(() => {
+        highlight.style.opacity = "0";
+        setTimeout(() => {
+            if (highlight.style.opacity === "0") {
+                highlight.style.display = "none";
+            }
+        }, 180);
+    }, 1400);
+    __selectorPing = { highlight, timeoutId };
+    return { ok: true, description: describeElement(el) };
+}
+
 function describeElement(el) {
     if (!el || !el.tagName) return "element";
     let desc = el.tagName.toLowerCase();
@@ -566,6 +951,17 @@ async function maybeDelegateStepToChildFrame(step) {
     return sendBridgeRequest(frameContext.frameElement.contentWindow, {
         type: "AF_RUN_STEP_REQUEST",
         step: childStep
+    });
+}
+
+async function maybeDelegatePingToChildFrame(selector, includeIframes = true) {
+    if (!includeIframes || typeof selector !== "string" || !selector.includes(">>>")) return null;
+    const frameContext = extractCrossOriginFrameContext(selector);
+    if (!frameContext?.frameElement?.contentWindow) return null;
+    return sendBridgeRequest(frameContext.frameElement.contentWindow, {
+        type: "AF_PING_SELECTOR_REQUEST",
+        selector: frameContext.remainingSelector,
+        includeIframes
     });
 }
 
@@ -672,6 +1068,21 @@ function waitForCondition(fn, timeoutMs = 60000, pollMs = 100) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || !msg.type) return;
     if (msg.type === "PING") { try { sendResponse?.({ ok: true, alive: true }); } catch {} return; }
+    if (msg.type === "PING_SELECTOR") {
+        (async () => {
+            if (window !== window.top) {
+                try { sendResponse?.({ ok: false, error: "ping_selector_top_frame_only" }); } catch {}
+                return;
+            }
+            const includeIframes = msg.readInsideIframes !== false;
+            const delegated = await maybeDelegatePingToChildFrame(msg.selector, includeIframes);
+            const result = delegated || await pingResolvedSelector(msg.selector, {
+                includeIframes
+            });
+            try { sendResponse?.(result); } catch {}
+        })();
+        return true;
+    }
     if (msg.type === "START_PICKER") {
         const ok = startSelectorPicker(msg.requestId || null, { broadcast: true });
         sendResponse?.({ ok });
@@ -748,7 +1159,30 @@ window.addEventListener("message", (event) => {
         return;
     }
 
+    if (data.type === "AF_PING_SELECTOR_REQUEST") {
+        (async () => {
+            const result = await pingResolvedSelector(data.selector, {
+                includeIframes: data.includeIframes !== false
+            });
+            postBridgeMessage(event.source, {
+                type: "AF_PING_SELECTOR_RESPONSE",
+                requestId: data.requestId,
+                result
+            });
+        })();
+        return;
+    }
+
     if (data.type === "AF_RUN_STEP_RESPONSE") {
+        const pending = __frameBridgePending.get(data.requestId);
+        if (!pending) return;
+        clearTimeout(pending.timeoutId);
+        __frameBridgePending.delete(data.requestId);
+        pending.resolve(data.result);
+        return;
+    }
+
+    if (data.type === "AF_PING_SELECTOR_RESPONSE") {
         const pending = __frameBridgePending.get(data.requestId);
         if (!pending) return;
         clearTimeout(pending.timeoutId);
@@ -961,6 +1395,42 @@ async function handleRunStep(step) {
                                 }
                                 return { ok: true };
                             }
+            }
+
+            case "KeyPress": {
+                const sequence = Array.isArray(step.keys) ? step.keys.map(normalizeRuntimeKeyCombo).filter(Boolean) : [];
+                if (!sequence.length) return { ok: false, error: "no_keys" };
+                const repeat = Math.max(1, Math.floor(Number(step.repeat) || 1));
+                const repeatDelayMs = Math.max(0, Number(step.repeatDelayMs) || 0);
+                const keyDelayMs = Math.max(0, Number(step.keyDelayMs) || 0);
+                const holdMs = Math.max(0, Number(step.holdMs) || 0);
+                const active = document.activeElement instanceof Element ? document.activeElement : null;
+                const target = active || document.body || document.documentElement;
+                try { target.focus?.(); } catch {}
+
+                for (let cycle = 0; cycle < repeat; cycle += 1) {
+                    for (let index = 0; index < sequence.length; index += 1) {
+                        try { target.focus?.(); } catch {}
+                        const native = await sendRuntimeMessage({
+                            type: "NATIVE_KEYPRESS",
+                            keys: [sequence[index]],
+                            repeat: 1,
+                            repeatDelayMs: 0,
+                            keyDelayMs: 0,
+                            holdMs
+                        });
+                        if (!native?.ok) {
+                            await pressKeyCombo(target, sequence[index], holdMs);
+                        }
+                        if (keyDelayMs > 0 && index < sequence.length - 1) {
+                            await sleep(keyDelayMs);
+                        }
+                    }
+                    if (repeatDelayMs > 0 && cycle < repeat - 1) {
+                        await sleep(repeatDelayMs);
+                    }
+                }
+                return { ok: true };
             }
 
                         case "SelectDropdown": {
@@ -1189,6 +1659,213 @@ async function waitForAllSelectors(selector, timeoutMs, options = {}) {
         await sleep(poll);
     }
     return [];
+}
+
+function normalizeRuntimeKeyCombo(combo) {
+    if (!combo || typeof combo !== "object") return null;
+    const key = typeof combo.key === "string" && combo.key ? combo.key : "";
+    const code = typeof combo.code === "string" && combo.code ? combo.code : key;
+    const primary = key || code;
+    if (!primary) return null;
+    const normalized = {
+        key: key || primary,
+        code: code || key || primary,
+        ctrlKey: Boolean(combo.ctrlKey),
+        altKey: Boolean(combo.altKey),
+        shiftKey: Boolean(combo.shiftKey),
+        metaKey: Boolean(combo.metaKey)
+    };
+    if (normalized.key === "Control") normalized.ctrlKey = false;
+    if (normalized.key === "Alt") normalized.altKey = false;
+    if (normalized.key === "Shift") normalized.shiftKey = false;
+    if (normalized.key === "Meta") normalized.metaKey = false;
+    return normalized;
+}
+
+function modifierFlagForKey(key) {
+    if (key === "Control") return "ctrlKey";
+    if (key === "Alt") return "altKey";
+    if (key === "Shift") return "shiftKey";
+    if (key === "Meta") return "metaKey";
+    return null;
+}
+
+function modifierSequenceFromCombo(combo) {
+    return [
+        { key: "Control", code: "ControlLeft", flag: "ctrlKey" },
+        { key: "Alt", code: "AltLeft", flag: "altKey" },
+        { key: "Shift", code: "ShiftLeft", flag: "shiftKey" },
+        { key: "Meta", code: "MetaLeft", flag: "metaKey" }
+    ].filter((item) => combo[item.flag]);
+}
+
+function buildKeyboardFlags(activeFlags) {
+    return {
+        ctrlKey: activeFlags.has("ctrlKey"),
+        altKey: activeFlags.has("altKey"),
+        shiftKey: activeFlags.has("shiftKey"),
+        metaKey: activeFlags.has("metaKey")
+    };
+}
+
+function dispatchKeyboard(target, type, key, code, activeFlags) {
+    const legacyCodeMap = {
+        Enter: 13,
+        Tab: 9,
+        Escape: 27,
+        " ": 32,
+        Space: 32,
+        Backspace: 8,
+        Delete: 46
+    };
+    const legacyKeyCode = legacyCodeMap[key] || (typeof key === "string" && key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0);
+    try {
+        target.dispatchEvent(new KeyboardEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            key,
+            code,
+            keyCode: legacyKeyCode,
+            which: legacyKeyCode,
+            charCode: type === "keypress" ? legacyKeyCode : 0,
+            ...buildKeyboardFlags(activeFlags)
+        }));
+    } catch {}
+}
+
+function isEditableTarget(target) {
+    if (!(target instanceof Element)) return false;
+    if (target.matches?.("textarea,input")) return true;
+    return Boolean(target.isContentEditable);
+}
+
+function replaceTextInFormControl(target, text, inputType = "insertText") {
+    const current = String(target.value ?? "");
+    const start = Number.isFinite(target.selectionStart) ? target.selectionStart : current.length;
+    const end = Number.isFinite(target.selectionEnd) ? target.selectionEnd : current.length;
+    const next = current.slice(0, start) + text + current.slice(end);
+    dispatchBeforeInput(target, inputType, text);
+    setNativeValue(target, next);
+    const caret = start + text.length;
+    try { target.setSelectionRange?.(caret, caret); } catch {}
+    try { target.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
+}
+
+function deleteTextInFormControl(target, direction) {
+    const current = String(target.value ?? "");
+    let start = Number.isFinite(target.selectionStart) ? target.selectionStart : current.length;
+    let end = Number.isFinite(target.selectionEnd) ? target.selectionEnd : current.length;
+    if (start === end) {
+        if (direction === "backward" && start > 0) start -= 1;
+        if (direction === "forward" && end < current.length) end += 1;
+    }
+    const next = current.slice(0, start) + current.slice(end);
+    dispatchBeforeInput(target, direction === "backward" ? "deleteContentBackward" : "deleteContentForward", "");
+    setNativeValue(target, next);
+    try { target.setSelectionRange?.(start, start); } catch {}
+    try { target.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
+}
+
+function mutateEditableTarget(target, combo) {
+    if (!isEditableTarget(target)) return false;
+    const keyValue = combo.key === "Space" ? " " : combo.key;
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+        if (!combo.ctrlKey && !combo.altKey && !combo.metaKey) {
+            if (keyValue === "Backspace") {
+                deleteTextInFormControl(target, "backward");
+                return true;
+            }
+            if (keyValue === "Delete") {
+                deleteTextInFormControl(target, "forward");
+                return true;
+            }
+            if (keyValue === "Enter" && target instanceof HTMLTextAreaElement) {
+                replaceTextInFormControl(target, "\n");
+                return true;
+            }
+            if (keyValue === "Tab" && target instanceof HTMLTextAreaElement) {
+                replaceTextInFormControl(target, "\t");
+                return true;
+            }
+            if (keyValue === " ") {
+                replaceTextInFormControl(target, " ");
+                return true;
+            }
+            if (typeof keyValue === "string" && keyValue.length === 1) {
+                replaceTextInFormControl(target, keyValue);
+                return true;
+            }
+        }
+        return false;
+    }
+    if (target.isContentEditable && !combo.ctrlKey && !combo.altKey && !combo.metaKey) {
+        if (keyValue === "Enter") {
+            try { document.execCommand("insertLineBreak"); return true; } catch {}
+        }
+        if (keyValue === " ") {
+            try { document.execCommand("insertText", false, " "); return true; } catch {}
+        }
+        if (typeof keyValue === "string" && keyValue.length === 1) {
+            try { document.execCommand("insertText", false, keyValue); return true; } catch {}
+        }
+    }
+    return false;
+}
+
+function triggerEnterFallback(target) {
+    if (!(target instanceof Element)) return false;
+    if (target instanceof HTMLButtonElement) {
+        try { target.click(); return true; } catch {}
+    }
+    if (target instanceof HTMLAnchorElement) {
+        try { target.click(); return true; } catch {}
+    }
+    const role = target.getAttribute?.("role");
+    if (role && ["button", "link", "menuitem", "option", "tab", "treeitem"].includes(role)) {
+        try { target.click?.(); return true; } catch {}
+    }
+    if (target instanceof HTMLInputElement && target.form && !["button", "submit", "reset"].includes((target.type || "").toLowerCase())) {
+        try {
+            if (typeof target.form.requestSubmit === "function") {
+                target.form.requestSubmit();
+            } else {
+                target.form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+            }
+            return true;
+        } catch {}
+    }
+    return false;
+}
+
+async function pressKeyCombo(target, combo, holdMs = 0) {
+    const normalized = normalizeRuntimeKeyCombo(combo);
+    if (!normalized || !target) return;
+    const modifiers = modifierSequenceFromCombo(normalized);
+    const activeFlags = new Set();
+    for (const modifier of modifiers) {
+        activeFlags.add(modifier.flag);
+        dispatchKeyboard(target, "keydown", modifier.key, modifier.code, activeFlags);
+    }
+
+    const primaryFlag = modifierFlagForKey(normalized.key);
+    const primaryFlags = new Set(activeFlags);
+    if (primaryFlag) primaryFlags.add(primaryFlag);
+    dispatchKeyboard(target, "keydown", normalized.key, normalized.code, primaryFlags);
+    if (normalized.key.length === 1 || normalized.key === "Enter" || normalized.key === "Space" || normalized.key === " " || normalized.key === "Tab") {
+        dispatchKeyboard(target, "keypress", normalized.key, normalized.code, primaryFlags);
+    }
+    const mutated = mutateEditableTarget(target, normalized);
+    if (!mutated && !normalized.ctrlKey && !normalized.altKey && !normalized.metaKey && normalized.key === "Enter") {
+        triggerEnterFallback(target);
+    }
+    if (holdMs > 0) await sleep(holdMs);
+    dispatchKeyboard(target, "keyup", normalized.key, normalized.code, primaryFlags);
+
+    for (let i = modifiers.length - 1; i >= 0; i -= 1) {
+        const modifier = modifiers[i];
+        activeFlags.delete(modifier.flag);
+        dispatchKeyboard(target, "keyup", modifier.key, modifier.code, activeFlags);
+    }
 }
 
 function focusAndSetValue(el, value) {

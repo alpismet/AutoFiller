@@ -29,4 +29,12 @@ Odak alanlari:
 - `extension/scripts/build.mjs`
 
 Bu repo tek seferlik demo gibi degil, gelistirilmeye devam edecek bir urun gibi ele alinacak. Mevcut davranisi koruyarak bakimi ve modulerligi iyilestir.
+
+Bu repo icin oturmus calisma konvansiyonlari:
+- Her kod degisikliklerinde patch versiyonunu artir (`package.json` ve `extension/public/manifest.json`)
+- Unpacked extension yenilemesini otomatik yapma; yalnizca kullanici acikca `g` veya `guncelle` dediginde dene
+- Selector/picker degisikliklerinde iframe, cross-frame bridge ve dinamik selector risklerini ayri dusun
+- `Wait` UI davranisinda countdown restore mantigini sadece son status'e degil deadline tabanli hesaplara dayandir
+- `GroupExecuter` ve group runtime UI degisikliklerinde ana flow ile ayni hata/ilerleme semantigini koru
+- Popup/status mesajlarinda uzun selector veya debug metinlerinin pencere genisligini bozmasina izin verme; kisalt ve tasma kontrolu ekle
 ```
